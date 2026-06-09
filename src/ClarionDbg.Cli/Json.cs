@@ -215,6 +215,22 @@ namespace ClarionDbg.Cli
             return sb.ToString();
         }
 
+        /// <summary>Resolved data symbol for watch-by-name. typeName null = unproven code (render hex).</summary>
+        public static string Sym(string name, bool found, uint rva, uint va, byte typeCode, string typeName, uint size, string container)
+        {
+            if (!found)
+                return "{\"event\":\"sym\",\"name\":" + Str(name) + ",\"found\":false}";
+            return "{\"event\":\"sym\",\"name\":" + Str(name)
+                 + ",\"found\":true"
+                 + ",\"rva\":\"0x" + rva.ToString("X") + "\""
+                 + ",\"va\":\"0x" + va.ToString("X") + "\""
+                 + ",\"type\":\"0x" + typeCode.ToString("X2") + "\""
+                 + ",\"typeName\":" + Str(typeName)
+                 + ",\"size\":" + size
+                 + ",\"container\":" + Str(container)
+                 + "}";
+        }
+
         public static string Error(string message)
         {
             return "{\"event\":\"error\",\"message\":" + Str(message) + "}";

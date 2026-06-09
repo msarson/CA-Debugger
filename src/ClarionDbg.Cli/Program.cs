@@ -21,6 +21,7 @@ namespace ClarionDbg.Cli
                     case "runs": return Runs(args);
                     case "lines": return Lines(args);
                     case "symbols": return Symbols(args);
+                    case "globals": return Globals(args);
                     case "break": return Break(args);
                     default: Usage(); return 1;
                 }
@@ -50,6 +51,10 @@ namespace ClarionDbg.Cli
             Console.WriteLine("      List decoded symbol definitions (procedures, class methods, routines) with");
             Console.WriteLine("      entry RVA + owning module. Default text view groups top-level procs by module.");
             Console.WriteLine();
+            Console.WriteLine("  ClarionDbg globals <exe> [--module NAME] [--name SUBSTR]");
+            Console.WriteLine("      List static data symbols (globals + file record buffers with their fields,");
+            Console.WriteLine("      offsets, type codes, and sizes). RVAs are link-time template addresses.");
+            Console.WriteLine();
             Console.WriteLine("  ClarionDbg resolve <exe> --addr 0xRVA");
             Console.WriteLine("      Map a code RVA (or VA) to its module + source line (address -> line).");
             Console.WriteLine();
@@ -63,8 +68,8 @@ namespace ClarionDbg.Cli
             Console.WriteLine("      --bp may repeat; breakpoints persist (re-armed after each hit).");
             Console.WriteLine("      --interactive: pause at each hit and read stdin commands —");
             Console.WriteLine("        continue | step | stepover | stepout | bp add M:L | bp del M:L | bp list");
-            Console.WriteLine("        | mem 0xADDR LEN | regs | stack [maxFrames] | quit");
-            Console.WriteLine("        (while running: bp add/del/list, quit)");
+            Console.WriteLine("        | mem 0xADDR LEN | regs | stack [maxFrames] | sym NAME | quit");
+            Console.WriteLine("        (while running: bp add/del/list, sym, quit)");
         }
 
         private static (PeImage pe, TswdDebugInfo dbg) LoadDebug(string exe)
@@ -356,6 +361,42 @@ namespace ClarionDbg.Cli
                     Console.WriteLine($"  0x{s.EntryRva:X6}  {s.Kind,-9}  {s.Name}  [{s.RawName}]");
             }
             return 0;
+        }
+
+        private static int Globals(string[] args)
+        {
+            if (args.Length < 2) { Usage(); return 1; }
+            var (pe, dbg) = LoadDebug(args[1]);
+            var syms = dbg.DataSymbols ?? new List<DataSymbol>();
+
+            string module = GetOpt(args, "--module");
+            if (module != null)
+            {
+                int mi = dbg.FindModuleIdx(module);
+                if (mi < 0) { Console.Error.WriteLine($"{module} -> unknown module"); return 3; }
+                syms = syms.Where(s => s.ModuleIdx == mi).ToList();
+            }
+            string filter = GetOpt(args, "--name");
+            if (filter != null)
+                syms = syms.Where(s => s.Name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0
+                                    || (s.Fields != null && s.Fields.Any(f => f.Name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0)))
+                           .ToList();
+
+            int groups = syms.Count(s => s.Fields != null);
+            Console.WriteLine($"{syms.Count} data symbol(s), {groups} with fields:");
+            foreach (var s in syms)
+            {
+                string ty = TswdDebugInfo.TypeCodeName(s.TypeCode) ?? (s.TypeCode != 0 ? $"type 0x{s.TypeCode:X2}" : "?");
+                string mod = dbg.ModuleNameForIdx(s.ModuleIdx) ?? "?";
+                Console.WriteLine($"  0x{s.Rva:X6}  {s.Name,-32} {ty,-10} size {s.Size,-6} {mod}");
+                if (s.Fields == null) continue;
+                foreach (var f in s.Fields)
+                {
+                    string fty = TswdDebugInfo.TypeCodeName(f.TypeCode) ?? $"type 0x{f.TypeCode:X2}";
+                    Console.WriteLine($"            +{f.Offset,-4} {f.Name,-30} {fty,-10} size {f.Size}");
+                }
+            }
+            return syms.Count > 0 ? 0 : 3;
         }
 
         private static int Break(string[] args)

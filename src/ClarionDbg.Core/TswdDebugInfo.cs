@@ -86,6 +86,30 @@ namespace ClarionDbg.Core
         public bool ContainsRva(uint rva) { return rva >= RvaMin && rva <= RvaMax; }
     }
 
+    /// <summary>One field of a GROUP/RECORD data symbol (a tag-0C member record).</summary>
+    public sealed class DataField
+    {
+        public string Name;      // pool name, e.g. JOB:JOBID
+        public uint Offset;      // byte offset within the parent record buffer
+        public byte TypeCode;    // raw TSWD type code (0x11 SHORT, 0x12 BYTE, 0x18 STRING, ...)
+        public uint Size;        // bytes; derived from the next field's offset when the type tail is complex
+    }
+
+    /// <summary>
+    /// A static data symbol (tag-04 definition with its RVA outside .text): a plain global or a
+    /// FILE record buffer (GROUP, with fields). The RVA is the link-time TEMPLATE address — for
+    /// THREADed data (.cwtls) the per-thread instance may differ at runtime (see TSWD-format.md).
+    /// </summary>
+    public sealed class DataSymbol
+    {
+        public string Name;      // pool name, e.g. SAVEPATH or JOBS$JOB:RECORD
+        public uint Rva;
+        public int ModuleIdx;
+        public byte TypeCode;    // 0x08 = GROUP/RECORD; 0 = unknown
+        public uint Size;        // 0 = unknown
+        public List<DataField> Fields;   // non-null when TypeCode is GROUP/RECORD
+    }
+
     /// <summary>
     /// Parser for the Clarion "TSWD" embedded debug blob (TopSpeed Watcom Debug).
     /// Decodes the TOC header, module-name table, and both line-number tables.
@@ -117,6 +141,10 @@ namespace ClarionDbg.Core
         /// <summary>Structured code-symbol definitions (procs/methods/routines/runtime), sorted by
         /// EntryRva. Built from the 12-byte definition records — see <see cref="ProcSymbol"/>.</summary>
         public List<ProcSymbol> Symbols { get; private set; }
+
+        /// <summary>Static data symbols (globals + file record buffers with fields), sorted by Rva.
+        /// Same definition records as <see cref="Symbols"/> but with the RVA in a data section.</summary>
+        public List<DataSymbol> DataSymbols { get; private set; }
 
         /// <summary>Per-module line sub-tables (LEGACY: sliced by the +0x10 byte map — mis-buckets
         /// records because the map cuts mid-run. Kept for diagnostics/compat; prefer <see cref="Runs"/>).</summary>
@@ -152,6 +180,8 @@ namespace ClarionDbg.Core
         // .text bounds (RVA) used to validate record framing; 0..uint.Max disables the check.
         private readonly uint _textLo;
         private readonly uint _textHi;
+        // end of the highest section (RVA) — bounds data-symbol RVA validation.
+        private readonly uint _imageHi;
 
         // Lazily-built global address index over all modules' records, sorted by RVA.
         private List<KeyValuePair<uint, ModuleSlice>> _addrIndex;
@@ -168,23 +198,31 @@ namespace ClarionDbg.Core
             var t = pe.Text;
             uint lo = t != null ? t.VirtualAddress : 0;
             uint hi = t != null ? t.VirtualAddress + t.VirtualSize : uint.MaxValue;
-            return new TswdDebugInfo(pe.Bytes, (int)e.PointerToRawData, lo, hi);
+            uint imageHi = 0;
+            foreach (var s in pe.Sections)
+                if (s.VirtualAddress + s.Span > imageHi) imageHi = s.VirtualAddress + s.Span;
+            return new TswdDebugInfo(pe.Bytes, (int)e.PointerToRawData, lo, hi, imageHi);
         }
 
         public TswdDebugInfo(byte[] bytes, int blobOffset)
-            : this(bytes, blobOffset, 0, uint.MaxValue) { }
+            : this(bytes, blobOffset, 0, uint.MaxValue, uint.MaxValue) { }
 
         public TswdDebugInfo(byte[] bytes, int blobOffset, uint textLo, uint textHi)
+            : this(bytes, blobOffset, textLo, textHi, uint.MaxValue) { }
+
+        public TswdDebugInfo(byte[] bytes, int blobOffset, uint textLo, uint textHi, uint imageHi)
         {
             _b = bytes;
             _base = blobOffset;
             _textLo = textLo;
             _textHi = textHi;
+            _imageHi = imageHi;
             ModuleNames = new List<string>();
             Modules = new List<ModuleSlice>();
             ByLine = new List<LineRec>();
             ByAddr = new List<LineRec>();
             SymbolPool = new List<string>();
+            DataSymbols = new List<DataSymbol>();
 
             if (U32(0) != TswdMagic)
                 throw new InvalidOperationException("Bad TSWD magic at blob offset.");
@@ -420,7 +458,9 @@ namespace ClarionDbg.Core
                 uint nameRef = U32(o);
                 if (nameRef < 1 || nameRef >= (uint)poolLen) continue;
                 uint rva = U32(o + 4);
-                if (rva < _textLo || rva >= _textHi) continue;
+                bool inText = rva >= _textLo && rva < _textHi;
+                bool inData = !inText && rva >= 0x1000 && rva < _imageHi;
+                if (!inText && !inData) continue;
                 uint backref = U32(o + 8);
                 int modIdx;
                 if (!backrefs.TryGetValue(backref, out modIdx)) continue;
@@ -429,11 +469,137 @@ namespace ClarionDbg.Core
                 if (raw.StartsWith("__thunk.", StringComparison.Ordinal)) continue;
                 if (!seen.Add(raw + "|" + rva)) continue;
 
-                var sym = new ProcSymbol { RawName = raw, EntryRva = rva, ModuleIdx = modIdx };
-                Demangle(raw, sym);
-                Symbols.Add(sym);
+                if (inText)
+                {
+                    var sym = new ProcSymbol { RawName = raw, EntryRva = rva, ModuleIdx = modIdx };
+                    Demangle(raw, sym);
+                    Symbols.Add(sym);
+                }
+                else
+                {
+                    DataSymbols.Add(BuildDataSymbol(o, raw, rva, modIdx, poolLen));
+                }
             }
             Symbols.Sort((a, b) => a.EntryRva.CompareTo(b.EntryRva));
+            DataSymbols.Sort((a, b) => a.Rva.CompareTo(b.Rva));
+            BuildDataNameIndex();
+        }
+
+        /// <summary>
+        /// Complete a data symbol from its definition record. The record is
+        /// `04 link nameRef rva backref` with type info following the 12-byte triple (which starts
+        /// at o): flags @o+12, type code @o+13, u32 size @o+14. GROUP/RECORD (0x08) additionally
+        /// carries u32 fieldCount @o+18, a child-pointer array, and the field member records
+        /// (tag 0x0C) FOLLOWING it in the stream, each holding parentRef == this record's link
+        /// value @o-4 — that exact-match key is how fields are bound (see TSWD-format.md).
+        /// </summary>
+        private DataSymbol BuildDataSymbol(int o, string name, uint rva, int modIdx, int poolLen)
+        {
+            var ds = new DataSymbol { Name = name, Rva = rva, ModuleIdx = modIdx };
+            if (_base + o + 22 > _b.Length) return ds;
+
+            byte flags = _b[_base + o + 12];
+            byte code = _b[_base + o + 13];
+            uint size = U32(o + 14);
+            if (flags != 0) return ds;                    // unrecognized tail — leave type unknown
+            if (size == 0 || size > 0x100000) return ds;  // implausible
+            ds.TypeCode = code;
+            ds.Size = size;
+
+            if (code != 0x08) return ds;                  // simple static — done
+
+            // GROUP/RECORD: field count + child-ptr array, then the tag-0C field records.
+            uint count = U32(o + 18);
+            if (count == 0 || count > 512) return ds;
+            ds.Fields = new List<DataField>();
+            uint parentKey = U32(o - 4);                  // this record's link value
+            int p = o + 22 + (int)count * 4;              // just past the child-pointer array
+            int window = p + 0x8000;                      // generous scan window for big records
+            while (p + 22 <= _b.Length - _base && p < window && ds.Fields.Count < (int)count)
+            {
+                if (_b[_base + p] == 0x0C && U32(p + 13) == parentKey)
+                {
+                    uint fNameRef = U32(p + 5);
+                    uint fOff = U32(p + 9);
+                    string fName = fNameRef >= 1 && fNameRef < (uint)poolLen
+                        ? SymbolNameAt((int)fNameRef, poolLen) : null;
+                    if (fName != null && fOff < ds.Size)
+                    {
+                        byte fType = _b[_base + p + 17];
+                        uint fSize = U32(p + 18);
+                        if (fSize == 0 || fSize > ds.Size) fSize = 0;   // complex tail — derive later
+                        ds.Fields.Add(new DataField { Name = fName, Offset = fOff, TypeCode = fType, Size = fSize });
+                        p += 17;                          // past the fixed head; tails vary
+                        continue;
+                    }
+                }
+                p++;
+            }
+
+            // derive sizes the simple {type,u32 size} parse couldn't give (e.g. STRING tails):
+            // a field runs to the next field's offset (last field runs to the record's end).
+            ds.Fields.Sort((a, b) => a.Offset.CompareTo(b.Offset));
+            for (int i = 0; i < ds.Fields.Count; i++)
+            {
+                uint limit = i + 1 < ds.Fields.Count ? ds.Fields[i + 1].Offset : ds.Size;
+                uint span = limit > ds.Fields[i].Offset ? limit - ds.Fields[i].Offset : 0;
+                if (ds.Fields[i].Size == 0 || ds.Fields[i].Size > span) ds.Fields[i].Size = span;
+            }
+            return ds;
+        }
+
+        // name -> resolved location for watch-by-name (statics + record fields, case-insensitive)
+        private Dictionary<string, DataLocation> _dataNames;
+
+        /// <summary>A resolved data name: absolute (image-relative) RVA + type/size + container.</summary>
+        public struct DataLocation
+        {
+            public uint Rva;
+            public byte TypeCode;
+            public uint Size;
+            public string Container;   // the record-buffer symbol a field belongs to; null for statics
+            public int ModuleIdx;
+        }
+
+        private void BuildDataNameIndex()
+        {
+            _dataNames = new Dictionary<string, DataLocation>(StringComparer.OrdinalIgnoreCase);
+            foreach (var ds in DataSymbols)
+            {
+                if (!_dataNames.ContainsKey(ds.Name))
+                    _dataNames[ds.Name] = new DataLocation { Rva = ds.Rva, TypeCode = ds.TypeCode, Size = ds.Size, Container = null, ModuleIdx = ds.ModuleIdx };
+                if (ds.Fields == null) continue;
+                foreach (var f in ds.Fields)
+                    if (!_dataNames.ContainsKey(f.Name))
+                        _dataNames[f.Name] = new DataLocation { Rva = ds.Rva + f.Offset, TypeCode = f.TypeCode, Size = f.Size, Container = ds.Name, ModuleIdx = ds.ModuleIdx };
+            }
+        }
+
+        /// <summary>
+        /// Resolve a data name (global static, record-buffer symbol, or record field like
+        /// JOB:JOBID) to its template RVA + type/size. Case-insensitive exact match. NOTE:
+        /// THREADed (.cwtls) data resolves to the link-time template instance — the active
+        /// thread's instance may live elsewhere (runtime resolution is a later phase).
+        /// </summary>
+        public bool ResolveDataName(string name, out DataLocation loc)
+        {
+            loc = default(DataLocation);
+            if (string.IsNullOrEmpty(name) || _dataNames == null) return false;
+            return _dataNames.TryGetValue(name, out loc);
+        }
+
+        /// <summary>Clarion type name for a TSWD type code — PROVEN codes only (validated against
+        /// the clbrws dictionary); null for codes not yet confirmed. Render unknowns as hex.</summary>
+        public static string TypeCodeName(byte code)
+        {
+            switch (code)
+            {
+                case 0x08: return "GROUP";
+                case 0x11: return "SHORT";
+                case 0x12: return "BYTE";
+                case 0x18: return "STRING";
+                default: return null;
+            }
         }
 
         /// <summary>Validated name read for a pool-relative ref: must be NUL-preceded (a real

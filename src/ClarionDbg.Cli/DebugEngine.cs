@@ -640,7 +640,7 @@ namespace ClarionDbg.Cli
             if (EmitJson)
                 Console.WriteLine("@JSON " + Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved,
                     haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
-            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : "")} — commands: continue step stepover stepout bp mem regs stack quit");
+            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : "")} — commands: continue step stepover stepout bp mem regs stack sym quit");
 
             while (true)
             {
@@ -694,6 +694,10 @@ namespace ClarionDbg.Cli
                         HandleStackCommand(parts, ref ctx, haveCtx);
                         break;
 
+                    case "sym":
+                        HandleSymCommand(parts);
+                        break;
+
                     case "quit": case "q": case "kill":
                         Native.TerminateProcess(_hProcess, 0);
                         return; // the EXIT_PROCESS event ends the loop
@@ -743,6 +747,9 @@ namespace ClarionDbg.Cli
                     case "bp":
                         HandleBpCommand(parts);
                         break;
+                    case "sym":
+                        HandleSymCommand(parts);   // static lookup — safe while running
+                        break;
                     case "quit": case "q": case "kill":
                         if (_hProcess != IntPtr.Zero) Native.TerminateProcess(_hProcess, 0);
                         break;
@@ -783,6 +790,29 @@ namespace ClarionDbg.Cli
             if (sub == "add") AddBreakpoint(module, lineNo);
             else if (sub == "del" || sub == "remove" || sub == "rm") RemoveBreakpoint(module, lineNo);
             else EmitError("unknown bp subcommand: " + sub);
+        }
+
+        /// <summary>
+        /// sym NAME — resolve a data name (global, record buffer, or record field like JOB:JOBID)
+        /// to its live VA + type/size so the host can follow up with a mem read. Resolution is
+        /// static (TSWD tables), so it is valid while paused OR running. The VA is the link-time
+        /// template instance — for THREADed (.cwtls) data the active thread's copy may differ.
+        /// </summary>
+        private void HandleSymCommand(string[] parts)
+        {
+            if (parts.Length < 2) { EmitError("sym expects: sym NAME"); return; }
+            string name = parts[1];
+            TswdDebugInfo.DataLocation loc;
+            if (!_dbg.ResolveDataName(name, out loc))
+            {
+                if (EmitJson) Console.WriteLine("@JSON " + Json.Sym(name, false, 0, 0, 0, null, 0, null));
+                Console.WriteLine($"  sym {name}: not found");
+                return;
+            }
+            uint va = _loadBase + loc.Rva;
+            string tn = TswdDebugInfo.TypeCodeName(loc.TypeCode);
+            if (EmitJson) Console.WriteLine("@JSON " + Json.Sym(name, true, loc.Rva, va, loc.TypeCode, tn, loc.Size, loc.Container));
+            Console.WriteLine($"  sym {name}: VA 0x{va:X} (RVA 0x{loc.Rva:X}) {(tn ?? $"type 0x{loc.TypeCode:X2}")} size {loc.Size}{(loc.Container != null ? " in " + loc.Container : "")}");
         }
 
         /// <summary>mem 0xADDR LEN — read target memory while paused (for the watch pane).</summary>
