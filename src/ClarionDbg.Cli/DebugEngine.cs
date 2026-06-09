@@ -1,41 +1,121 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Threading;
 using ClarionDbg.Core;
 
 namespace ClarionDbg.Cli
 {
+    /// <summary>A requested breakpoint location (module:line), resolved and planted by the engine.</summary>
+    internal sealed class BpSpec
+    {
+        public readonly string Module;
+        public readonly int Line;
+        public BpSpec(string module, int line) { Module = module; Line = line; }
+    }
+
+    /// <summary>One logical user breakpoint: a module:line bound to its code RVAs.</summary>
+    internal sealed class UserBreakpoint
+    {
+        public string Module;          // canonical module name (e.g. clbrws011.clw)
+        public int ModuleIdx;
+        public int RequestedLine;      // the line the user asked for
+        public int Line;               // the line actually planted (snapped to nearest record line)
+        public readonly List<uint> Rvas = new List<uint>();
+    }
+
     /// <summary>
-    /// Minimal x86 debug engine: launches a target under the Windows debug API, plants INT3
-    /// breakpoints at chosen RVAs, pumps the debug-event loop, and on a hit reads the thread
-    /// context and resolves the address to a module + source line via TSWD info.
+    /// x86 debug engine: launches a target under the Windows debug API, plants INT3 breakpoints,
+    /// pumps the debug-event loop, and resolves hits to module + source line via TSWD info.
+    ///
+    /// Phase 2 adds:
+    ///  - persistent breakpoints (re-armed after each hit via a TF single-step over the original byte)
+    ///  - multiple module:line breakpoints, with runtime add/remove
+    ///  - an interactive stdin command loop while paused: continue / step / stepover / stepout /
+    ///    bp add|del|list / mem / regs / quit  (while running: bp add|del|list / quit)
+    ///  - source-level stepping driven by the TF single-step flag + the +0x1C line table, with a
+    ///    call-skip optimization (temp INT3 at the return address) so callees run at full speed —
+    ///    no x86 instruction decoder needed.
     /// </summary>
     internal sealed class DebugEngine
     {
+        private enum StepMode { None, Into, Over, Out }
+
+        private const uint TRAP_FLAG = 0x100;        // EFLAGS TF bit
+        private const int MAX_STEPS = 2000000;       // hard cap of single-steps per step command
+        private const uint CALL_WINDOW = 8;          // max CALL instr length for return-addr detection
+        private const uint PROLOGUE_WINDOW = 0x100;  // callee with a line record this close to entry is Clarion code
+        private const uint ESP_SLACK = 0x10;         // frame-depth slack for step-over stop checks
+        private const uint OUT_GAP_MAX = 0x200;      // step-out: max gap for "this looks like the call statement"
+
         private readonly string _exe;
         private readonly TswdDebugInfo _dbg;
         private readonly bool _once;
         private readonly int _waitMs;
+        private readonly bool _interactive;
+        private readonly List<uint> _rawRvas;
+        private readonly List<BpSpec> _initialSpecs;
 
         /// <summary>When true, emit one machine-readable JSON object per event (for the IDE addin).</summary>
         public bool EmitJson;
 
         private IntPtr _hProcess = IntPtr.Zero;
-        private uint _imageBase;             // PE preferred base (for RVA reporting)
-        private uint _loadBase;              // actual load base from CREATE_PROCESS event
-        private readonly List<uint> _bpRvas;
-        // absolute address -> original byte, for planted breakpoints
-        private readonly Dictionary<uint, byte> _planted = new Dictionary<uint, byte>();
+        private uint _imageBase;             // PE preferred base — log/reporting only; never used in live VA math
+        private uint _loadBase;              // actual load base from CREATE_PROCESS event — ALL live VA math uses this
         private bool _seenInitialBreak;
         public int Hits { get; private set; }
 
-        public DebugEngine(string exe, TswdDebugInfo dbg, uint imageBase, List<uint> bpRvas, bool once, int waitMs)
+        // logical user breakpoints + armed-byte map (VA -> original byte)
+        private readonly List<UserBreakpoint> _bps = new List<UserBreakpoint>();
+        private readonly Dictionary<uint, byte> _armed = new Dictionary<uint, byte>();
+        // internal temp breakpoints (call-skip return addresses): VA -> original byte
+        private readonly Dictionary<uint, byte> _temp = new Dictionary<uint, byte>();
+
+        // re-arm: a VA whose original byte was restored so the real instruction can execute; re-plant
+        // 0xCC after one single-step. Keyed by the thread that restored the byte and consumed by THAT
+        // thread's next single-step — a scalar here loses re-plants when a second thread hits a
+        // breakpoint (or a recursive temp BP fires) between the restore and its single-step.
+        private struct Rearm { public uint Va; public bool IsTemp; }
+        private readonly Dictionary<uint, Rearm> _rearm = new Dictionary<uint, Rearm>();
+
+        // source-level stepping state
+        private StepMode _mode = StepMode.None;
+        private uint _stepTid;
+        private uint _startEsp;       // ESP at step start (stack grows down: larger = shallower)
+        private int _startLine;
+        private int _startModIdx;
+        private uint _prevVa;         // EIP at the previous single-step trap (for call-entry detection)
+        private int _stepCount;
+        private bool _skipRunning;    // running full-speed to a call-skip temp BP; TF off
+        private uint _skipEntryEsp;   // ESP at the callee's entry instruction (return depth = this + 4)
+
+        private readonly ConcurrentQueue<string> _cmds = new ConcurrentQueue<string>();
+
+        public DebugEngine(string exe, TswdDebugInfo dbg, uint imageBase, List<uint> rawRvas,
+                           List<BpSpec> specs, bool once, int waitMs, bool interactive)
         {
-            _exe = exe; _dbg = dbg; _imageBase = imageBase; _bpRvas = bpRvas; _once = once; _waitMs = waitMs;
+            _exe = exe; _dbg = dbg; _imageBase = imageBase;
+            _rawRvas = rawRvas ?? new List<uint>();
+            _initialSpecs = specs ?? new List<BpSpec>();
+            _once = once; _waitMs = waitMs; _interactive = interactive;
         }
 
         public int Run()
         {
+            if (_interactive) StartStdinReader();
+
+            // resolve module:line specs up front so bp-set/bp-error report before launch
+            foreach (var s in _initialSpecs) AddBreakpoint(s.Module, s.Line);
+            // raw RVAs (legacy --rva/--entry/--all-entries) become anonymous breakpoints
+            foreach (var rva in _rawRvas) AddRawBreakpoint(rva);
+
+            if (_bps.Count == 0 && !_interactive)
+            {
+                Console.Error.WriteLine("nothing to break on — no breakpoint resolved");
+                return -1;
+            }
+
             var si = new Native.STARTUPINFO();
             si.cb = (uint)System.Runtime.InteropServices.Marshal.SizeOf(si);
             Native.PROCESS_INFORMATION pi;
@@ -46,15 +126,22 @@ namespace ClarionDbg.Cli
             if (!ok)
                 throw new InvalidOperationException("CreateProcess failed, win32 error " + System.Runtime.InteropServices.Marshal.GetLastWin32Error());
 
-            Console.WriteLine($"launched {Path.GetFileName(_exe)} (pid {pi.dwProcessId}); breakpoints at {_bpRvas.Count} RVA(s)");
+            Console.WriteLine($"launched {Path.GetFileName(_exe)} (pid {pi.dwProcessId}); {_bps.Count} breakpoint(s)");
             _hProcess = pi.hProcess;
 
             var buf = new byte[1024];
             bool running = true;
+            uint pollMs = _interactive ? 200u : (uint)_waitMs;
             while (running)
             {
-                if (!Native.WaitForDebugEvent(buf, (uint)_waitMs))
+                if (!Native.WaitForDebugEvent(buf, pollMs))
                 {
+                    if (_interactive)
+                    {
+                        // no event — service any commands that arrived while the target runs
+                        DrainCommandsWhileRunning();
+                        continue;
+                    }
                     Console.WriteLine("(timeout waiting for debug event — terminating target)");
                     Native.TerminateProcess(_hProcess, 0);
                     // drain until exit
@@ -76,24 +163,31 @@ namespace ClarionDbg.Cli
                     case Native.CREATE_PROCESS_DEBUG_EVENT:
                         // union @+12: hFile(+12) hProcess(+16) hThread(+20) lpBaseOfImage(+24)
                         _loadBase = U32(buf, 24);
-                        PlantBreakpoints();
+                        PlantAll();
                         Console.WriteLine($"process created: loadBase=0x{_loadBase:X} (preferred 0x{_imageBase:X}){(_loadBase != _imageBase ? "  [relocated]" : "")}");
+                        if (EmitJson) Console.WriteLine("@JSON " + Json.Loaded(pi.dwProcessId, _loadBase));
                         break;
 
                     case Native.EXCEPTION_DEBUG_EVENT:
-                        // union @+12: EXCEPTION_RECORD: code(+12) flags(+16) recPtr(+20) addr(+24); firstChance after record
+                        // union @+12: EXCEPTION_RECORD: code(+12) flags(+16) recPtr(+20) addr(+24)
                         uint exCode = U32(buf, 12);
                         uint exAddr = U32(buf, 24);
                         if (exCode == Native.EXCEPTION_BREAKPOINT)
                         {
-                            if (_planted.ContainsKey(exAddr))
-                                status = OnBreakpointHit(pid, tid, exAddr, ref running);
+                            if (_armed.ContainsKey(exAddr))
+                                status = OnUserBp(tid, exAddr);
+                            else if (_temp.ContainsKey(exAddr))
+                                status = OnTempBp(tid, exAddr);
                             else if (!_seenInitialBreak)
                             {
                                 _seenInitialBreak = true; // OS loader breakpoint — swallow it
                                 status = Native.DBG_CONTINUE;
                             }
                             else status = Native.DBG_CONTINUE;
+                        }
+                        else if (exCode == Native.EXCEPTION_SINGLE_STEP)
+                        {
+                            status = OnSingleStep(tid);
                         }
                         else
                         {
@@ -103,7 +197,9 @@ namespace ClarionDbg.Cli
                         break;
 
                     case Native.EXIT_PROCESS_DEBUG_EVENT:
-                        Console.WriteLine($"process exited (code {U32(buf, 12)})");
+                        uint exitCode = U32(buf, 12);
+                        Console.WriteLine($"process exited (code {exitCode})");
+                        if (EmitJson) Console.WriteLine("@JSON " + Json.Exited(exitCode));
                         running = false;
                         break;
 
@@ -122,35 +218,189 @@ namespace ClarionDbg.Cli
             return Hits;
         }
 
-        private void PlantBreakpoints()
+        // ------------------------------------------------------------------ breakpoint management
+
+        /// <summary>Resolve module:line to RVAs (snapping to the nearest record line) and register it.</summary>
+        private void AddBreakpoint(string module, int line)
         {
-            foreach (var rva in _bpRvas)
+            int mi = _dbg.FindModuleIdx(module);
+            if (mi < 0)
             {
-                uint addr = _loadBase + rva;
-                var orig = new byte[1];
-                int read;
-                if (!Native.ReadProcessMemory(_hProcess, (IntPtr)addr, orig, 1, out read) || read != 1)
+                Console.WriteLine($"bp: unknown module {module}");
+                if (EmitJson) Console.WriteLine("@JSON " + Json.BpError(module, line, "unknown module"));
+                return;
+            }
+            string canon = _dbg.ModuleNameForIdx(mi) ?? module;
+            int planted = line;
+            var rvas = _dbg.LineToRvasInModuleIdx(mi, line);
+            if (rvas.Count == 0)
+            {
+                // Clarion's line table is sparse — snap to the nearest line that has a record
+                int snapped = NearestIn(_dbg.BreakableLinesInModuleIdx(mi), line);
+                if (snapped > 0) { planted = snapped; rvas = _dbg.LineToRvasInModuleIdx(mi, snapped); }
+            }
+            if (rvas.Count == 0)
+            {
+                Console.WriteLine($"bp: no code records in {canon} (line {line})");
+                if (EmitJson) Console.WriteLine("@JSON " + Json.BpError(canon, line, "no code records in module"));
+                return;
+            }
+            // adding an existing planted line is a no-op (re-confirm so the UI can sync)
+            foreach (var b in _bps)
+                if (b.ModuleIdx == mi && b.Line == planted)
                 {
-                    Console.WriteLine($"  WARN: could not read memory at 0x{addr:X} (RVA 0x{rva:X}) — breakpoint skipped");
+                    if (EmitJson) Console.WriteLine("@JSON " + Json.BpSet(b.Module, line, b.Line, b.Rvas));
+                    return;
+                }
+
+            var bp = new UserBreakpoint { Module = canon, ModuleIdx = mi, RequestedLine = line, Line = planted };
+            bp.Rvas.AddRange(rvas);
+            _bps.Add(bp);
+            if (_loadBase != 0) PlantBp(bp);
+            if (planted != line)
+                Console.WriteLine($"bp: line {line} has no code record in {canon}; breakpoint moved to nearest line {planted}");
+            Console.WriteLine($"bp: set {canon}:{planted} ({bp.Rvas.Count} address(es))");
+            if (EmitJson) Console.WriteLine("@JSON " + Json.BpSet(canon, line, planted, bp.Rvas));
+        }
+
+        /// <summary>Register a raw RVA (legacy --rva/--entry) as an anonymous breakpoint.</summary>
+        private void AddRawBreakpoint(uint rva)
+        {
+            int line; int mi; uint recRva;
+            bool resolved = _dbg.ResolveAddr(rva, out line, out mi, out recRva);
+            var bp = new UserBreakpoint
+            {
+                Module = resolved ? _dbg.ModuleNameForIdx(mi) : null,
+                ModuleIdx = resolved ? mi : -1,
+                RequestedLine = resolved ? line : 0,
+                Line = resolved ? line : 0
+            };
+            bp.Rvas.Add(rva);
+            _bps.Add(bp);
+            if (_loadBase != 0) PlantBp(bp);
+        }
+
+        private void RemoveBreakpoint(string module, int line)
+        {
+            int mi = _dbg.FindModuleIdx(module);
+            string canon = mi >= 0 ? (_dbg.ModuleNameForIdx(mi) ?? module) : module;
+            UserBreakpoint found = null;
+            foreach (var b in _bps)
+                if (b.ModuleIdx == mi && (b.Line == line || b.RequestedLine == line)) { found = b; break; }
+            if (found == null)
+            {
+                if (EmitJson) Console.WriteLine("@JSON " + Json.BpError(canon, line, "no such breakpoint"));
+                return;
+            }
+            foreach (var rva in found.Rvas)
+            {
+                uint va = _loadBase + rva;
+                byte orig;
+                if (_loadBase != 0 && _armed.TryGetValue(va, out orig))
+                {
+                    // if a thread restored this byte and its re-plant is still pending, cancel the
+                    // re-plant instead of writing (the byte is already the original)
+                    uint pendingTid = 0; bool pending = false;
+                    foreach (var kv in _rearm)
+                        if (!kv.Value.IsTemp && kv.Value.Va == va) { pendingTid = kv.Key; pending = true; break; }
+                    if (pending) _rearm.Remove(pendingTid);
+                    else WriteByte(va, orig);
+                    _armed.Remove(va);
+                }
+            }
+            _bps.Remove(found);
+            Console.WriteLine($"bp: removed {canon}:{found.Line}");
+            if (EmitJson) Console.WriteLine("@JSON " + Json.BpDel(canon, found.Line));
+        }
+
+        private void PlantAll()
+        {
+            foreach (var bp in _bps) PlantBp(bp);
+        }
+
+        private void PlantBp(UserBreakpoint bp)
+        {
+            foreach (var rva in bp.Rvas)
+            {
+                uint va = _loadBase + rva;
+                if (_armed.ContainsKey(va)) continue;
+                byte orig;
+                if (!ReadByte(va, out orig))
+                {
+                    Console.WriteLine($"  WARN: could not read memory at 0x{va:X} (RVA 0x{rva:X}) — breakpoint skipped");
                     continue;
                 }
-                int wrote;
-                Native.WriteProcessMemory(_hProcess, (IntPtr)addr, new byte[] { 0xCC }, 1, out wrote);
-                Native.FlushInstructionCache(_hProcess, (IntPtr)addr, (IntPtr)1);
-                _planted[addr] = orig[0];
+                WriteByte(va, 0xCC);
+                _armed[va] = orig;
             }
         }
 
-        private uint OnBreakpointHit(uint pid, uint tid, uint addr, ref bool running)
+        /// <summary>Nearest breakable line: smallest &gt;= line (forward snap), else largest &lt; line.</summary>
+        private static int NearestIn(List<int> sorted, int line)
+        {
+            if (sorted == null || sorted.Count == 0) return -1;
+            int fwd = int.MaxValue, back = -1;
+            foreach (int v in sorted)
+            {
+                if (v == line) return line;
+                if (v > line && v < fwd) fwd = v;
+                if (v < line && v > back) back = v;
+            }
+            return fwd != int.MaxValue ? fwd : back;
+        }
+
+        // ------------------------------------------------------------------ breakpoint hits
+
+        private uint OnUserBp(uint tid, uint va)
         {
             Hits++;
-            uint rva = addr - _loadBase;
+            uint rva = va - _loadBase;
 
+            IntPtr hThread = OpenThreadForContext(tid);
+            var ctx = NewContext();
+            bool haveCtx = hThread != IntPtr.Zero && Native.GetThreadContext(hThread, ref ctx);
+
+            // un-patch: restore the original byte and back EIP up over the INT3 so the real
+            // instruction executes on resume; re-plant after one single-step (persistent BP)
+            byte orig = _armed[va];
+            WriteByte(va, orig);
+            if (haveCtx)
+            {
+                ctx.Eip = va; // EIP was va+1 after the 0xCC
+                Native.SetThreadContext(hThread, ref ctx);
+            }
+            _rearm[tid] = new Rearm { Va = va, IsTemp = false };
+            CancelStep(); // a real BP hit supersedes any in-flight step (drops temp re-arms, not this one)
+
+            ReportHit(rva, va, ref ctx, haveCtx);
+
+            if (_once)
+            {
+                Console.WriteLine("  --once: terminating target after first hit.");
+                Native.TerminateProcess(_hProcess, 0);
+            }
+            else if (_interactive)
+            {
+                PausedWait(tid, hThread, ref ctx, haveCtx, "breakpoint");
+            }
+            else if (haveCtx)
+            {
+                // non-interactive: keep running, but single-step once so the BP re-arms
+                Native.GetThreadContext(hThread, ref ctx);
+                ctx.EFlags |= TRAP_FLAG;
+                Native.SetThreadContext(hThread, ref ctx);
+            }
+
+            if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
+            return Native.DBG_CONTINUE;
+        }
+
+        private void ReportHit(uint rva, uint va, ref Native.CONTEXT_X86 ctx, bool haveCtx)
+        {
             Console.WriteLine();
             Console.WriteLine("*** BREAKPOINT HIT ***");
-            Console.WriteLine($"  VA 0x{addr:X}  (loadBase 0x{_loadBase:X} + RVA 0x{rva:X})");
+            Console.WriteLine($"  VA 0x{va:X}  (loadBase 0x{_loadBase:X} + RVA 0x{rva:X})");
 
-            // v2: resolve via the clean +0x1C table (rva -> {line, moduleIdx}); .clw name = names[moduleIdx].
             int line; int moduleIdx; uint recRva;
             bool resolved = _dbg.ResolveAddr(rva, out line, out moduleIdx, out recRva);
             string modName = resolved ? _dbg.ModuleNameForIdx(moduleIdx) : null;
@@ -168,39 +418,456 @@ namespace ClarionDbg.Cli
                 Console.WriteLine("  -> (no source line for this address)");
 
             if (EmitJson)
-                Console.WriteLine("@JSON " + Json.Hit(modName, line, rva, addr, gap, resolved));
+                Console.WriteLine("@JSON " + Json.Hit(modName, line, rva, va, gap, resolved));
 
-            // read & report the thread context
-            var ctx = NewContext();
-            IntPtr hThread = OpenThreadForContext(tid);
-            // We don't have a thread handle directly from the buffer for EXCEPTION events, so re-open.
-            if (hThread != IntPtr.Zero && Native.GetThreadContext(hThread, ref ctx))
+            if (haveCtx)
             {
                 Console.WriteLine($"  EAX={ctx.Eax:X8} EBX={ctx.Ebx:X8} ECX={ctx.Ecx:X8} EDX={ctx.Edx:X8}");
                 Console.WriteLine($"  ESI={ctx.Esi:X8} EDI={ctx.Edi:X8} EBP={ctx.Ebp:X8} ESP={ctx.Esp:X8}");
                 Console.WriteLine($"  EIP={ctx.Eip:X8} EFLAGS={ctx.EFlags:X8}");
+            }
+            else
+                Console.WriteLine("  (could not read thread context)");
+        }
 
-                // un-patch: restore original byte and back EIP up over the INT3 so execution resumes correctly
-                byte orig = _planted[addr];
-                int wrote;
-                Native.WriteProcessMemory(_hProcess, (IntPtr)addr, new byte[] { orig }, 1, out wrote);
-                Native.FlushInstructionCache(_hProcess, (IntPtr)addr, (IntPtr)1);
-                ctx.Eip = addr; // EIP was addr+1 after the 0xCC
-                Native.SetThreadContext(hThread, ref ctx);
-                _planted.Remove(addr); // one-shot
-                Native.CloseHandle(hThread);
+        private uint OnTempBp(uint tid, uint va)
+        {
+            IntPtr hThread = OpenThreadForContext(tid);
+            var ctx = NewContext();
+            bool haveCtx = hThread != IntPtr.Zero && Native.GetThreadContext(hThread, ref ctx);
+
+            byte orig = _temp[va];
+            WriteByte(va, orig);
+            if (haveCtx) ctx.Eip = va;
+
+            // recursion guard: the same call-site return address fires for INNER frames too.
+            // We've truly returned to our frame only when ESP is back above the callee entry.
+            bool returned = haveCtx && ctx.Esp >= _skipEntryEsp + 4;
+            if (_mode != StepMode.None && !returned)
+            {
+                // deeper frame returning through the same code point — re-arm and keep running
+                _rearm[tid] = new Rearm { Va = va, IsTemp = true };
+                if (haveCtx)
+                {
+                    ctx.EFlags |= TRAP_FLAG; // one step to get off the restored byte, then re-plant
+                    Native.SetThreadContext(hThread, ref ctx);
+                }
             }
             else
             {
-                Console.WriteLine("  (could not read thread context)");
+                _temp.Remove(va);
+                _skipRunning = false;
+                if (_mode != StepMode.None && haveCtx)
+                {
+                    // back at the caller — resume source-level stepping
+                    _prevVa = va;
+                    ctx.EFlags |= TRAP_FLAG;
+                    Native.SetThreadContext(hThread, ref ctx);
+                }
+                else if (haveCtx)
+                {
+                    Native.SetThreadContext(hThread, ref ctx); // just fix EIP
+                }
             }
 
-            if (_once)
-            {
-                Console.WriteLine("  --once: terminating target after first hit.");
-                Native.TerminateProcess(_hProcess, 0);
-            }
+            if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
             return Native.DBG_CONTINUE;
+        }
+
+        // ------------------------------------------------------------------ single-step machine
+
+        private uint OnSingleStep(uint tid)
+        {
+            IntPtr hThread = OpenThreadForContext(tid);
+            var ctx = NewContext();
+            bool haveCtx = hThread != IntPtr.Zero && Native.GetThreadContext(hThread, ref ctx);
+
+            // 1) pending re-plant after THIS thread stepped off a restored breakpoint byte
+            Rearm pr;
+            if (_rearm.TryGetValue(tid, out pr))
+            {
+                bool stillWanted = pr.IsTemp ? _temp.ContainsKey(pr.Va) : _armed.ContainsKey(pr.Va);
+                if (stillWanted) WriteByte(pr.Va, 0xCC);
+                _rearm.Remove(tid);
+            }
+
+            // 2) drive the step machine (TF auto-clears on each trap; re-set it to keep stepping)
+            if (_mode != StepMode.None && tid == _stepTid && !_skipRunning && haveCtx)
+                StepMachine(tid, hThread, ref ctx);
+
+            if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
+            return Native.DBG_CONTINUE;
+        }
+
+        private void StepMachine(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx)
+        {
+            _stepCount++;
+            uint va = ctx.Eip;
+            uint rva = va - _loadBase;
+
+            // call-entry detection: the stack top holds an address just past the previous trap →
+            // we just stepped INTO a CALL. Follow Clarion callees (step-into); skip everything else
+            // at full speed via a temp INT3 at the return address.
+            if (_prevVa != 0)
+            {
+                uint ret = ReadU32(ctx.Esp);
+                if (ret > _prevVa && ret - _prevVa <= CALL_WINDOW && ret != va)
+                {
+                    bool follow = _mode == StepMode.Into && HasRecordInRange(rva, PROLOGUE_WINDOW);
+                    if (!follow)
+                    {
+                        bool covered = _armed.ContainsKey(ret); // a user BP there already pauses us
+                        if (!covered)
+                        {
+                            byte orig;
+                            if (!_temp.ContainsKey(ret) && ReadByte(ret, out orig))
+                            {
+                                WriteByte(ret, 0xCC);
+                                _temp[ret] = orig;
+                                covered = true;
+                            }
+                            else if (_temp.ContainsKey(ret))
+                                covered = true;
+                        }
+                        if (covered)
+                        {
+                            _skipEntryEsp = ctx.Esp;
+                            _skipRunning = true;
+                            _prevVa = va;
+                            return; // TF stays clear → full speed until the temp BP (or a user BP)
+                        }
+                        // couldn't plant — fall through and keep instruction-stepping
+                    }
+                }
+            }
+
+            // stop check: pause at the next statement boundary appropriate for the mode
+            int line; int mi; uint recRva;
+            bool resolved = _dbg.ResolveAddr(rva, out line, out mi, out recRva);
+            uint gap = resolved ? rva - recRva : 0;
+            bool atRecord = resolved && gap == 0;
+            bool newStatement = atRecord && (line != _startLine || mi != _startModIdx);
+            bool stop = false;
+            switch (_mode)
+            {
+                case StepMode.Into:
+                    stop = newStatement;
+                    break;
+                case StepMode.Over:
+                    stop = newStatement && ctx.Esp + ESP_SLACK >= _startEsp;
+                    break;
+                case StepMode.Out:
+                    stop = resolved && ctx.Esp > _startEsp && gap <= OUT_GAP_MAX;
+                    break;
+            }
+
+            if (!stop && _stepCount >= MAX_STEPS)
+            {
+                Console.WriteLine($"  (step limit reached after {_stepCount} instructions — pausing here)");
+                StopStepAndPause(tid, hThread, ref ctx, "step-limit");
+                return;
+            }
+            if (stop)
+            {
+                StopStepAndPause(tid, hThread, ref ctx, "step");
+                return;
+            }
+
+            // keep stepping
+            _prevVa = va;
+            ctx.EFlags |= TRAP_FLAG;
+            Native.SetThreadContext(hThread, ref ctx);
+        }
+
+        private void StopStepAndPause(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, string reason)
+        {
+            CancelStep();
+            uint va = ctx.Eip;
+            byte orig;
+            if (_armed.TryGetValue(va, out orig))
+            {
+                // landed exactly on a user breakpoint byte — restore it so the instruction can
+                // execute on resume, and re-plant after one single-step
+                WriteByte(va, orig);
+                _rearm[tid] = new Rearm { Va = va, IsTemp = false };
+            }
+            PausedWait(tid, hThread, ref ctx, true, reason);
+        }
+
+        private void CancelStep()
+        {
+            _mode = StepMode.None;
+            _skipRunning = false;
+            foreach (var kv in _temp) WriteByte(kv.Key, kv.Value);
+            _temp.Clear();
+            // drop pending TEMP re-plants (their bytes were just restored); user-BP re-plants survive
+            var drop = new List<uint>();
+            foreach (var kv in _rearm) if (kv.Value.IsTemp) drop.Add(kv.Key);
+            foreach (var t in drop) _rearm.Remove(t);
+        }
+
+        // ------------------------------------------------------------------ pause + command loop
+
+        /// <summary>
+        /// Blocks the debug loop (target fully suspended — the debug event is not continued) and
+        /// services stdin commands until a resume-type command arrives.
+        /// </summary>
+        private void PausedWait(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx, string reason)
+        {
+            uint va = haveCtx ? ctx.Eip : 0;
+            uint rva = va - _loadBase;
+            int line = 0; int mi = -1; uint recRva = 0;
+            bool resolved = haveCtx && _dbg.ResolveAddr(rva, out line, out mi, out recRva);
+            if (!resolved) { line = 0; mi = -1; recRva = 0; }
+            string mod = resolved ? _dbg.ModuleNameForIdx(mi) : null;
+            uint gap = resolved ? rva - recRva : 0;
+
+            if (EmitJson)
+                Console.WriteLine("@JSON " + Json.Paused(reason, mod, resolved ? line : 0, rva, va, gap, resolved,
+                    haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
+            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")} — commands: continue step stepover stepout bp mem regs quit");
+
+            while (true)
+            {
+                string cmd;
+                if (!_cmds.TryDequeue(out cmd)) { Thread.Sleep(20); continue; }
+                cmd = cmd.Trim();
+                if (cmd.Length == 0) continue;
+                var parts = cmd.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                string verb = parts[0].ToLowerInvariant();
+                switch (verb)
+                {
+                    case "continue": case "c": case "g":
+                        EmitResumed("continue");
+                        ArmResume(tid, hThread, ref ctx, haveCtx, false);
+                        return;
+
+                    case "step": case "stepinto": case "s": case "i":
+                        BeginStep(StepMode.Into, tid, ref ctx, haveCtx, resolved, line, mi);
+                        EmitResumed("step");
+                        ArmResume(tid, hThread, ref ctx, haveCtx, true);
+                        return;
+
+                    case "stepover": case "next": case "n":
+                        BeginStep(StepMode.Over, tid, ref ctx, haveCtx, resolved, line, mi);
+                        EmitResumed("stepover");
+                        ArmResume(tid, hThread, ref ctx, haveCtx, true);
+                        return;
+
+                    case "stepout": case "out": case "finish": case "o":
+                        BeginStep(StepMode.Out, tid, ref ctx, haveCtx, resolved, line, mi);
+                        EmitResumed("stepout");
+                        ArmResume(tid, hThread, ref ctx, haveCtx, true);
+                        return;
+
+                    case "bp":
+                        HandleBpCommand(parts);
+                        break;
+
+                    case "regs":
+                        if (haveCtx && EmitJson)
+                            Console.WriteLine("@JSON " + Json.RegsEvent(Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags)));
+                        else if (haveCtx)
+                            Console.WriteLine($"  EAX={ctx.Eax:X8} EBX={ctx.Ebx:X8} ECX={ctx.Ecx:X8} EDX={ctx.Edx:X8} ESI={ctx.Esi:X8} EDI={ctx.Edi:X8} EBP={ctx.Ebp:X8} ESP={ctx.Esp:X8} EIP={ctx.Eip:X8}");
+                        break;
+
+                    case "mem":
+                        HandleMemCommand(parts);
+                        break;
+
+                    case "quit": case "q": case "kill":
+                        Native.TerminateProcess(_hProcess, 0);
+                        return; // the EXIT_PROCESS event ends the loop
+
+                    default:
+                        EmitError("unknown command: " + verb);
+                        break;
+                }
+            }
+        }
+
+        private void BeginStep(StepMode mode, uint tid, ref Native.CONTEXT_X86 ctx, bool haveCtx, bool resolved, int line, int mi)
+        {
+            _mode = mode;
+            _stepTid = tid;
+            _startEsp = haveCtx ? ctx.Esp : 0;
+            _startLine = resolved ? line : -1;
+            _startModIdx = resolved ? mi : -1;
+            _prevVa = haveCtx ? ctx.Eip : 0;
+            _stepCount = 0;
+            _skipRunning = false;
+        }
+
+        /// <summary>Set TF on the paused thread when the resume needs a single-step (BP re-arm or stepping).</summary>
+        private void ArmResume(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx, bool stepping)
+        {
+            if (!haveCtx) return;
+            bool needTf = stepping || _rearm.ContainsKey(tid);
+            if (!needTf) return;
+            Native.GetThreadContext(hThread, ref ctx); // refresh — EIP was rewritten at hit time
+            ctx.EFlags |= TRAP_FLAG;
+            Native.SetThreadContext(hThread, ref ctx);
+        }
+
+        /// <summary>Commands accepted while the target is running (between debug events).</summary>
+        private void DrainCommandsWhileRunning()
+        {
+            string cmd;
+            while (_cmds.TryDequeue(out cmd))
+            {
+                cmd = cmd.Trim();
+                if (cmd.Length == 0) continue;
+                var parts = cmd.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                string verb = parts[0].ToLowerInvariant();
+                switch (verb)
+                {
+                    case "bp":
+                        HandleBpCommand(parts);
+                        break;
+                    case "quit": case "q": case "kill":
+                        if (_hProcess != IntPtr.Zero) Native.TerminateProcess(_hProcess, 0);
+                        break;
+                    case "continue": case "c": case "g":
+                    case "step": case "stepinto": case "s": case "i":
+                    case "stepover": case "next": case "n":
+                    case "stepout": case "out": case "finish": case "o":
+                    case "mem": case "regs":
+                        EmitError("target is running — " + verb + " is only valid while paused");
+                        break;
+                    default:
+                        EmitError("unknown command: " + verb);
+                        break;
+                }
+            }
+        }
+
+        /// <summary>bp add module:line | bp del module:line | bp list</summary>
+        private void HandleBpCommand(string[] parts)
+        {
+            string sub = parts.Length > 1 ? parts[1].ToLowerInvariant() : "list";
+            if (sub == "list")
+            {
+                if (EmitJson) Console.WriteLine("@JSON " + Json.BpList(_bps));
+                else foreach (var b in _bps) Console.WriteLine($"  bp {b.Module}:{b.Line} ({b.Rvas.Count} addr)");
+                return;
+            }
+            if (parts.Length < 3) { EmitError("bp " + sub + " expects module:line"); return; }
+            string spec = parts[2];
+            int colon = spec.LastIndexOf(':');
+            int lineNo;
+            if (colon <= 0 || !int.TryParse(spec.Substring(colon + 1), out lineNo))
+            {
+                EmitError("bp " + sub + " expects module:line, got '" + spec + "'");
+                return;
+            }
+            string module = spec.Substring(0, colon);
+            if (sub == "add") AddBreakpoint(module, lineNo);
+            else if (sub == "del" || sub == "remove" || sub == "rm") RemoveBreakpoint(module, lineNo);
+            else EmitError("unknown bp subcommand: " + sub);
+        }
+
+        /// <summary>mem 0xADDR LEN — read target memory while paused (for the watch pane).</summary>
+        private void HandleMemCommand(string[] parts)
+        {
+            if (parts.Length < 3) { EmitError("mem expects: mem 0xADDR LEN"); return; }
+            uint addr; int len;
+            string a = parts[1].Trim();
+            try
+            {
+                addr = a.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                    ? Convert.ToUInt32(a.Substring(2), 16)
+                    : Convert.ToUInt32(a);
+            }
+            catch { EmitError("mem: bad address '" + a + "'"); return; }
+            if (!int.TryParse(parts[2], out len) || len <= 0 || len > 4096)
+            {
+                EmitError("mem: length must be 1..4096");
+                return;
+            }
+            var buf = new byte[len];
+            int read;
+            Native.ReadProcessMemory(_hProcess, (IntPtr)addr, buf, len, out read);
+            if (read <= 0)
+            {
+                EmitError($"mem: read failed at 0x{addr:X}");
+                return;
+            }
+            // echo the REQUESTED len so the host can correlate the reply to its request even when
+            // the read came back short; bytes carries only what was actually read
+            if (EmitJson) Console.WriteLine("@JSON " + Json.Mem(addr, buf, read, len));
+            else Console.WriteLine($"  mem 0x{addr:X}: {BitConverter.ToString(buf, 0, read).Replace("-", "")}");
+        }
+
+        private void EmitResumed(string mode)
+        {
+            if (EmitJson) Console.WriteLine("@JSON " + Json.Resumed(mode));
+            Console.WriteLine($"  [resumed: {mode}]");
+        }
+
+        private void EmitError(string message)
+        {
+            if (EmitJson) Console.WriteLine("@JSON " + Json.Error(message));
+            Console.WriteLine("  ERROR: " + message);
+        }
+
+        // ------------------------------------------------------------------ helpers
+
+        private void StartStdinReader()
+        {
+            var t = new Thread(() =>
+            {
+                try
+                {
+                    string line;
+                    while ((line = Console.In.ReadLine()) != null)
+                        _cmds.Enqueue(line);
+                }
+                catch { /* stdin torn down */ }
+                // stdin closed → the host (IDE addin) went away; kill the target rather than orphan it
+                _cmds.Enqueue("quit");
+            });
+            t.IsBackground = true;
+            t.Name = "stdin-commands";
+            t.Start();
+        }
+
+        /// <summary>Is there a line record in [rva, rva+window]? (Used to spot Clarion callees.)</summary>
+        private bool HasRecordInRange(uint rva, uint window)
+        {
+            var t = _dbg.AddrTable;
+            if (t == null || t.Count == 0) return false;
+            int lo = 0, hi = t.Count - 1, ans = -1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) / 2;
+                if (t[mid].Rva >= rva) { ans = mid; hi = mid - 1; }
+                else lo = mid + 1;
+            }
+            return ans >= 0 && t[ans].Rva <= rva + window;
+        }
+
+        private bool ReadByte(uint va, out byte value)
+        {
+            var b = new byte[1];
+            int read;
+            bool ok = Native.ReadProcessMemory(_hProcess, (IntPtr)va, b, 1, out read) && read == 1;
+            value = ok ? b[0] : (byte)0;
+            return ok;
+        }
+
+        private void WriteByte(uint va, byte value)
+        {
+            int wrote;
+            Native.WriteProcessMemory(_hProcess, (IntPtr)va, new[] { value }, 1, out wrote);
+            Native.FlushInstructionCache(_hProcess, (IntPtr)va, (IntPtr)1);
+        }
+
+        private uint ReadU32(uint va)
+        {
+            var b = new byte[4];
+            int read;
+            if (!Native.ReadProcessMemory(_hProcess, (IntPtr)va, b, 4, out read) || read != 4) return 0;
+            return BitConverter.ToUInt32(b, 0);
         }
 
         private static Native.CONTEXT_X86 NewContext()

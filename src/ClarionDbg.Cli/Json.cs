@@ -1,3 +1,6 @@
+using System.Collections.Generic;
+using System.Text;
+
 namespace ClarionDbg.Cli
 {
     /// <summary>Tiny hand-rolled JSON for the engine's machine-readable event output.</summary>
@@ -6,7 +9,30 @@ namespace ClarionDbg.Cli
         public static string Str(string s)
         {
             if (s == null) return "null";
-            return "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+            // Escape control chars too: events are framed one-per-line on stdout, so a raw \n in a
+            // debuggee-controlled string (e.g. a hostile TSWD module name) could otherwise forge a
+            // second @JSON event line in the host addin.
+            var sb = new System.Text.StringBuilder(s.Length + 2);
+            sb.Append('"');
+            foreach (char c in s)
+            {
+                switch (c)
+                {
+                    case '\\': sb.Append("\\\\"); break;
+                    case '"': sb.Append("\\\""); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    case '\b': sb.Append("\\b"); break;
+                    case '\f': sb.Append("\\f"); break;
+                    default:
+                        if (c < 0x20) sb.Append("\\u").Append(((int)c).ToString("x4"));
+                        else sb.Append(c);
+                        break;
+                }
+            }
+            sb.Append('"');
+            return sb.ToString();
         }
 
         public static string Hit(string module, int line, uint rva, uint va, uint gap, bool resolved)
@@ -23,13 +49,127 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>The set of breakable (record-carrying) source lines for a module — for gutter markers.</summary>
-        public static string Lines(string module, System.Collections.Generic.List<int> lines)
+        public static string Lines(string module, List<int> lines)
         {
-            var sb = new System.Text.StringBuilder();
+            var sb = new StringBuilder();
             sb.Append("{\"event\":\"lines\",\"module\":").Append(Str(module)).Append(",\"lines\":[");
             for (int i = 0; i < lines.Count; i++) { if (i > 0) sb.Append(','); sb.Append(lines[i]); }
             sb.Append("]}");
             return sb.ToString();
+        }
+
+        // ------------------------------------------------------------------ Phase 2 events
+
+        public static string Loaded(uint pid, uint loadBase)
+        {
+            return "{\"event\":\"loaded\",\"pid\":" + pid + ",\"loadBase\":\"0x" + loadBase.ToString("X") + "\"}";
+        }
+
+        public static string Exited(uint code)
+        {
+            return "{\"event\":\"exited\",\"code\":" + code + "}";
+        }
+
+        /// <summary>Register block — embedded inside paused/regs events (pass to Paused/RegsEvent).</summary>
+        public static string Regs(uint eax, uint ebx, uint ecx, uint edx, uint esi, uint edi, uint ebp, uint esp, uint eip, uint eflags)
+        {
+            return "{\"eax\":\"0x" + eax.ToString("X8") + "\""
+                 + ",\"ebx\":\"0x" + ebx.ToString("X8") + "\""
+                 + ",\"ecx\":\"0x" + ecx.ToString("X8") + "\""
+                 + ",\"edx\":\"0x" + edx.ToString("X8") + "\""
+                 + ",\"esi\":\"0x" + esi.ToString("X8") + "\""
+                 + ",\"edi\":\"0x" + edi.ToString("X8") + "\""
+                 + ",\"ebp\":\"0x" + ebp.ToString("X8") + "\""
+                 + ",\"esp\":\"0x" + esp.ToString("X8") + "\""
+                 + ",\"eip\":\"0x" + eip.ToString("X8") + "\""
+                 + ",\"eflags\":\"0x" + eflags.ToString("X8") + "\"}";
+        }
+
+        /// <summary>Target paused (breakpoint hit, step complete, or step-limit). regsJson may be null.</summary>
+        public static string Paused(string reason, string module, int line, uint rva, uint va, uint gap, bool resolved, string regsJson)
+        {
+            return "{\"event\":\"paused\""
+                 + ",\"reason\":" + Str(reason)
+                 + ",\"resolved\":" + (resolved ? "true" : "false")
+                 + ",\"module\":" + Str(module)
+                 + ",\"line\":" + line
+                 + ",\"rva\":\"0x" + rva.ToString("X") + "\""
+                 + ",\"va\":\"0x" + va.ToString("X") + "\""
+                 + ",\"gap\":" + gap
+                 + ",\"exact\":" + ((gap == 0 && resolved) ? "true" : "false")
+                 + ",\"regs\":" + (regsJson ?? "null")
+                 + "}";
+        }
+
+        public static string Resumed(string mode)
+        {
+            return "{\"event\":\"resumed\",\"mode\":" + Str(mode) + "}";
+        }
+
+        public static string RegsEvent(string regsJson)
+        {
+            return "{\"event\":\"regs\",\"regs\":" + (regsJson ?? "null") + "}";
+        }
+
+        public static string BpSet(string module, int requestedLine, int line, List<uint> rvas)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"event\":\"bp-set\",\"module\":").Append(Str(module))
+              .Append(",\"requestedLine\":").Append(requestedLine)
+              .Append(",\"line\":").Append(line)
+              .Append(",\"rvas\":[");
+            for (int i = 0; i < rvas.Count; i++)
+            {
+                if (i > 0) sb.Append(',');
+                sb.Append("\"0x").Append(rvas[i].ToString("X")).Append('"');
+            }
+            sb.Append("]}");
+            return sb.ToString();
+        }
+
+        public static string BpDel(string module, int line)
+        {
+            return "{\"event\":\"bp-del\",\"module\":" + Str(module) + ",\"line\":" + line + "}";
+        }
+
+        public static string BpError(string module, int line, string error)
+        {
+            return "{\"event\":\"bp-error\",\"module\":" + Str(module) + ",\"line\":" + line
+                 + ",\"error\":" + Str(error) + "}";
+        }
+
+        public static string BpList(List<UserBreakpoint> bps)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"event\":\"bp-list\",\"bps\":[");
+            for (int i = 0; i < bps.Count; i++)
+            {
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"module\":").Append(Str(bps[i].Module))
+                  .Append(",\"line\":").Append(bps[i].Line)
+                  .Append(",\"requestedLine\":").Append(bps[i].RequestedLine)
+                  .Append('}');
+            }
+            sb.Append("]}");
+            return sb.ToString();
+        }
+
+        /// <summary>len = the REQUESTED read size (host correlates replies on it); read = bytes
+        /// actually read, which is how many hex pairs follow in bytes.</summary>
+        public static string Mem(uint addr, byte[] bytes, int read, int len)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"event\":\"mem\",\"addr\":\"0x").Append(addr.ToString("X"))
+              .Append("\",\"len\":").Append(len)
+              .Append(",\"read\":").Append(read).Append(",\"bytes\":\"");
+            for (int i = 0; i < read; i++) sb.Append(bytes[i].ToString("X2"));
+            sb.Append("\"}");
+            return sb.ToString();
+        }
+
+        public static string Error(string message)
+        {
+            return "{\"event\":\"error\",\"message\":" + Str(message) + "}";
         }
     }
 }

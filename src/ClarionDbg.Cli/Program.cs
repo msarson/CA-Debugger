@@ -51,9 +51,14 @@ namespace ClarionDbg.Cli
             Console.WriteLine("  ClarionDbg resolve <exe> --line N [--module NAME]");
             Console.WriteLine("      Map a source line to code RVAs (line -> address); --module to scope it.");
             Console.WriteLine();
-            Console.WriteLine("  ClarionDbg break <exe> [--rva 0xX ...] [--line N --module M] [--entry] [--once] [--timeout ms]");
+            Console.WriteLine("  ClarionDbg break <exe> [--bp MODULE:LINE ...] [--rva 0xX ...] [--line N --module M]");
+            Console.WriteLine("                         [--entry] [--once] [--interactive] [--json] [--timeout ms]");
             Console.WriteLine("      Launch under the debugger, plant INT3 breakpoint(s), and on a hit report");
             Console.WriteLine("      the module + source line and register state. --once kills the target after first hit.");
+            Console.WriteLine("      --bp may repeat; breakpoints persist (re-armed after each hit).");
+            Console.WriteLine("      --interactive: pause at each hit and read stdin commands —");
+            Console.WriteLine("        continue | step | stepover | stepout | bp add M:L | bp del M:L | bp list");
+            Console.WriteLine("        | mem 0xADDR LEN | regs | quit   (while running: bp add/del/list, quit)");
         }
 
         private static (PeImage pe, TswdDebugInfo dbg) LoadDebug(string exe)
@@ -290,36 +295,36 @@ namespace ClarionDbg.Cli
                 if (string.Equals(args[i], "--rva", StringComparison.OrdinalIgnoreCase))
                     rvas.Add(ToRva(ParseNum(args[i + 1]), pe));
 
+            // --bp MODULE:LINE may appear multiple times; the engine resolves + snaps each one
+            var specs = new List<BpSpec>();
+            for (int i = 2; i < args.Length - 1; i++)
+            {
+                if (!string.Equals(args[i], "--bp", StringComparison.OrdinalIgnoreCase)) continue;
+                string v = args[i + 1];
+                int colon = v.LastIndexOf(':');
+                if (colon <= 0) { Console.Error.WriteLine($"--bp expects MODULE:LINE, got '{v}'"); return 1; }
+                specs.Add(new BpSpec(v.Substring(0, colon), (int)ParseNum(v.Substring(colon + 1))));
+            }
+
             string lineStr = GetOpt(args, "--line");
             if (lineStr != null)
             {
                 string module = GetOpt(args, "--module");
                 int line = (int)ParseNum(lineStr);
-                var hits = new List<uint>();
                 if (module != null)
                 {
-                    // v2: name -> moduleIdx (name-array index == moduleIdx), line -> addr via +0x1C.
-                    int mi = dbg.FindModuleIdx(module);
-                    if (mi < 0) { Console.Error.WriteLine($"unknown module {module}"); return 2; }
-                    int planted = line;
-                    hits = dbg.LineToRvasInModuleIdx(mi, line);
-                    if (hits.Count == 0)
-                    {
-                        // Clarion's line table is sparse — snap to the nearest line that has a record.
-                        int snapped = NearestIn(dbg.BreakableLinesInModuleIdx(mi), line);
-                        if (snapped > 0) { planted = snapped; hits = dbg.LineToRvasInModuleIdx(mi, snapped); }
-                    }
-                    if (hits.Count > 0 && planted != line)
-                        Console.WriteLine($"line {line} has no code record in {module}; breakpoint moved to nearest line {planted}");
+                    // legacy single-breakpoint form — equivalent to one --bp module:line
+                    specs.Add(new BpSpec(module, line));
                 }
                 else
                 {
                     // No module: match the line across all compilands via +0x1C (ambiguous — prefer --module).
+                    var hits = new List<uint>();
                     if (dbg.AddrTable != null)
                         foreach (var r in dbg.AddrTable) if (r.Line == line) hits.Add(r.Rva);
+                    if (hits.Count == 0) { Console.Error.WriteLine($"no code for line {line} in any module"); return 2; }
+                    rvas.AddRange(hits);
                 }
-                if (hits.Count == 0) { Console.Error.WriteLine($"no code for line {line}{(module != null ? " in " + module : "")} (and no nearby breakable line)"); return 2; }
-                rvas.AddRange(hits);
             }
 
             if (HasFlag(args, "--entry"))
@@ -342,9 +347,11 @@ namespace ClarionDbg.Cli
                 Console.WriteLine($"adding {added} module-entry breakpoints (discovery mode)");
             }
 
-            if (rvas.Count == 0)
+            bool interactive = HasFlag(args, "--interactive");
+            if (rvas.Count == 0 && specs.Count == 0 && !interactive)
             {
-                Console.Error.WriteLine("nothing to break on — specify --rva 0xX, --line N [--module M], or --entry");
+                // interactive sessions may start empty — breakpoints arrive via 'bp add' (gutter clicks)
+                Console.Error.WriteLine("nothing to break on — specify --bp M:L, --rva 0xX, --line N [--module M], or --entry");
                 return 1;
             }
 
@@ -353,9 +360,10 @@ namespace ClarionDbg.Cli
             string to = GetOpt(args, "--timeout");
             if (to != null) waitMs = (int)ParseNum(to);
 
-            var engine = new DebugEngine(args[1], dbg, pe.ImageBase, rvas, once, waitMs);
+            var engine = new DebugEngine(args[1], dbg, pe.ImageBase, rvas, specs, once, waitMs, interactive);
             engine.EmitJson = HasFlag(args, "--json");
             int hits2 = engine.Run();
+            if (hits2 < 0) { Console.Error.WriteLine("no breakpoint could be resolved"); return 2; }
             Console.WriteLine($"\ndone — {hits2} breakpoint hit(s).");
             return hits2 > 0 ? 0 : 3;
         }
