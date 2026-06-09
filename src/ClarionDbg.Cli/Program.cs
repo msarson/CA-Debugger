@@ -18,6 +18,7 @@ namespace ClarionDbg.Cli
                     case "dump": return Dump(args);
                     case "resolve": return Resolve(args);
                     case "modules": return Modules(args);
+                    case "runs": return Runs(args);
                     case "lines": return Lines(args);
                     case "break": return Break(args);
                     default: Usage(); return 1;
@@ -186,6 +187,20 @@ namespace ClarionDbg.Cli
                 int lo = m.Records.Count > 0 ? m.Records.Min(r => r.Line) : 0;
                 int hi = m.Records.Count > 0 ? m.Records.Max(r => r.Line) : 0;
                 Console.WriteLine($"  {m.Name,-16} slice 0x{m.SliceStart:X5}..0x{m.SliceEnd:X5} phase {m.Phase} recs {m.Records.Count,4}  lines {lo}..{hi}");
+            }
+            return 0;
+        }
+
+        private static int Runs(string[] args)
+        {
+            if (args.Length < 2) { Usage(); return 1; }
+            var (pe, dbg) = LoadDebug(args[1]);
+            Console.WriteLine($"Table A: {dbg.Runs.Count} line-major runs (continuous grid, segmented by line-resets)");
+            Console.WriteLine($"{"run",3} {"startByte",9} {"startRec",8} {"ph",2} {"lMin",6} {"lMax",6} {"rvaMin",9} {"rvaMax",9} {"nrec",5}  owner(+0x10)");
+            for (int i = 0; i < dbg.Runs.Count; i++)
+            {
+                var r = dbg.Runs[i];
+                Console.WriteLine($"{i,3} 0x{r.StartByteOffset:X6} {r.StartRecordIndex,8} {r.Phase,2} {r.LineMin,6} {r.LineMax,6} 0x{r.RvaMin:X6} 0x{r.RvaMax:X6} {r.Records.Count,5}  {r.OwnerHint}");
             }
             return 0;
         }

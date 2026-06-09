@@ -1,0 +1,27 @@
+TSWD Table-A run map — clbrws.exe (Clarion 11). Generated read-only by walker.ps1.
+KEY FACTS:
+ * Table A is ONE continuous 6-byte {u16 line, u32 rva} grid from blob+0x624. No per-chunk
+   realignment: a chunk's "phase" == (chunkStartByte - 0x624) mod 6. Walk the whole grid; do
+   NOT phase-detect per +0x10 chunk.
+ * Runs are delimited by LINE RESETS (line drops back to ~9-17). 10 groups, NOT 56.
+ * owner(+0x10) below is the module whose +0x10 byte-chunk contains the run start. It is
+   UNRELIABLE for content (the +0x10 chunks are byte-chopped and decoupled from runs) —
+   shown only for orientation. Trust RVA range + content match, not this name.
+ * Numbering is CUMULATIVE within a group: the FIRST proc maps table-line == .clw physical
+   line (base 0); subsequent procs are appended (base ~= sum of preceding procs' line counts).
+ * Each clbrwsNNN.clw = exactly one PROCEDURE (e.g. clbrws011.clw = SelectJobs).
+ * Regression anchor: resolve(line=317, clbrws011/SelectJobs) -> RVA 0x31F68 (exact).
+
+Table A [0x624,0x889C)  records=5566  runs(>=3 rec)=10  code-modules=56
+
+run startByte startRec  ph   lMin   lMax    rvaMin    rvaMax  nrec  owner(+0x10)
+  0 0x000624        0   0    203    373 0x08506A 0x0857AC    14  clbrws003.clw
+  1 0x000678       14   0      9   1217 0x02B560 0x02ED51   754  clbrws003.clw
+  2 0x001824      768   0     16    310 0x02EDE0 0x02F6D7   146  clbrws010.clw
+  3 0x001B90      914   0     17   1525 0x02F70C 0x033594   897  clbrws011.clw
+  4 0x003096     1811   0      9   1048 0x033620 0x03617E   631  clbrws019.clw
+  5 0x003F60     2442   0      9   1035 0x0361EC 0x03883E   624  clbrws024.clw
+  6 0x004E00     3066   0      9   1043 0x0388AC 0x03B2AB   637  clbrws030.clw
+  7 0x005CEE     3703   0      9   1063 0x03B324 0x03DB8D   644  ABPOPUP.CLW
+  8 0x006C06     4347   0      9   1004 0x03DBFC 0x040236   609  RTFCTL.CLW
+  9 0x007A4C     4956   0     17   1040 0x040940 0x04416C   610  SVGraph.clw

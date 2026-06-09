@@ -13,6 +13,30 @@ namespace ClarionDbg.Core
     }
 
     /// <summary>
+    /// A contiguous ascending line-major RUN within Table A. Table A is ONE continuous 6-byte
+    /// {u16 line, u32 rva} grid from blob+OffLineTableA; runs are delimited by line RESETS (the line
+    /// number dropping back to ~9-17 at a compiland-group boundary), NOT by the +0x10 byte map (which
+    /// is byte-chopped and decoupled from runs — see docs + spikes/tswd-runs.txt). Each run holds one
+    /// compiland group; line numbers are CUMULATIVE across the procedures in the group (the first proc
+    /// is base-0: table-line == .clw physical line; subsequent procs are appended and need a per-proc
+    /// base derived from the proc's entry RVA — the symbol table). RVAs are ascending within a run.
+    /// </summary>
+    public sealed class LineRun
+    {
+        public int StartRecordIndex;   // index into the continuous grid (counts every 6-byte slot)
+        public int StartByteOffset;    // blob-relative byte offset of the run's first record
+        public int Phase;              // (StartByteOffset - OffLineTableA) % 6 — informational only
+        public int LineMin, LineMax;
+        public uint RvaMin, RvaMax;
+        public List<LineRec> Records = new List<LineRec>();
+        /// <summary>The +0x10 module whose byte-chunk contains this run's start. UNRELIABLE for
+        /// content (orientation only) — trust RVA range + symbol-table proc entries instead.</summary>
+        public string OwnerHint;
+
+        public bool ContainsRva(uint rva) { return rva >= RvaMin && rva <= RvaMax; }
+    }
+
+    /// <summary>
     /// Parser for the Clarion "TSWD" embedded debug blob (TopSpeed Watcom Debug).
     /// Decodes the TOC header, module-name table, and both line-number tables.
     /// Layout reference: docs/TSWD-format.md.
@@ -40,8 +64,13 @@ namespace ClarionDbg.Core
         /// <summary>Best-effort list of symbol names from the symbol string pool (not yet structured).</summary>
         public List<string> SymbolPool { get; private set; }
 
-        /// <summary>Per-module line sub-tables (the authoritative, module-scoped line map).</summary>
+        /// <summary>Per-module line sub-tables (LEGACY: sliced by the +0x10 byte map — mis-buckets
+        /// records because the map cuts mid-run. Kept for diagnostics/compat; prefer <see cref="Runs"/>).</summary>
         public List<ModuleSlice> Modules { get; private set; }
+
+        /// <summary>Table A decoded correctly: one continuous grid segmented into line-major runs
+        /// (compiland groups). This is the v2 source of truth for line&lt;-&gt;address resolution.</summary>
+        public List<LineRun> Runs { get; private set; }
 
         // Raw TOC offsets (relative to blob base), exposed for diagnostics.
         public int OffModuleNameArray { get; private set; }
@@ -116,6 +145,10 @@ namespace ClarionDbg.Core
             //     module's blob-relative byte slice into the [LineTableA, LineTableB) region. ---
             BuildModules();
 
+            // --- v2: decode Table A as ONE continuous grid, segment into line-major runs by resets.
+            //     This is the correct model (the +0x10 byte slices above cut mid-run). ---
+            BuildRuns();
+
             // --- DIAGNOSTIC ONLY: flat parse of the same region. This drifts out of phase at
             //     module boundaries (slices are not 6-byte multiples) and is unreliable — kept
             //     only for comparison. Use Modules for real resolution. ---
@@ -168,6 +201,64 @@ namespace ClarionDbg.Core
                 }
                 Modules.Add(ms);
             }
+        }
+
+        /// <summary>
+        /// Decode Table A as a single continuous 6-byte {u16 line, u32 rva} grid from OffLineTableA and
+        /// segment it into ascending line-major RUNS. A run ends at a line RESET (line drops below the
+        /// run's running max by more than a small tolerance — a compiland-group boundary) or at an
+        /// invalid record. Runs shorter than 3 records are dropped (stray noise). Mirrors the verified
+        /// walker in spikes/tswd-run-walker.ps1 (reproduces spikes/tswd-runs.txt: 10 runs).
+        /// </summary>
+        private void BuildRuns()
+        {
+            Runs = new List<LineRun>();
+            LineRun cur = null;
+            int recIdx = 0;
+            for (int p = OffLineTableA; p + 6 <= OffLineTableB; p += 6, recIdx++)
+            {
+                int line = U16(p);
+                uint rva = U32(p + 2);
+                if (!RecordValid(line, rva)) { CloseRun(ref cur); continue; }
+                // Reset: a drop below the running max (>2 tolerates tiny non-monotonic noise within a run).
+                if (cur != null && line < cur.LineMax - 2) CloseRun(ref cur);
+                if (cur == null)
+                {
+                    cur = new LineRun
+                    {
+                        StartRecordIndex = recIdx,
+                        StartByteOffset = p,
+                        Phase = (p - OffLineTableA) % 6,
+                        LineMin = line, LineMax = line,
+                        RvaMin = rva, RvaMax = rva,
+                        OwnerHint = OwnerNameAtByte(p)
+                    };
+                }
+                if (line < cur.LineMin) cur.LineMin = line;
+                if (line > cur.LineMax) cur.LineMax = line;
+                if (rva < cur.RvaMin) cur.RvaMin = rva;
+                if (rva > cur.RvaMax) cur.RvaMax = rva;
+                cur.Records.Add(new LineRec(line, rva));
+            }
+            CloseRun(ref cur);
+        }
+
+        /// <summary>Commit a run if it carries enough records to be real (drops stray fragments).</summary>
+        private void CloseRun(ref LineRun r)
+        {
+            if (r != null && r.Records.Count >= 3) Runs.Add(r);
+            r = null;
+        }
+
+        /// <summary>The +0x10 module whose byte-chunk contains a blob-relative byte offset (orientation
+        /// hint only — the +0x10 chunks are byte-chopped and do NOT bound runs).</summary>
+        private string OwnerNameAtByte(int blobByteOffset)
+        {
+            uint b = (uint)blobByteOffset;
+            foreach (var m in Modules)
+                if (m.SliceEnd > m.SliceStart && b >= m.SliceStart && b < m.SliceEnd)
+                    return m.Name;
+            return "?";
         }
 
         /// <summary>Pick the 6-byte phase (0..5) that yields the most valid records in [start,end).</summary>
