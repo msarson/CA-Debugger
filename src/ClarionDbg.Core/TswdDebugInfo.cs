@@ -1,0 +1,332 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace ClarionDbg.Core
+{
+    /// <summary>One line-number table record: a source line mapped to a code RVA.</summary>
+    public struct LineRec
+    {
+        public int Line;
+        public uint Rva;
+        public LineRec(int line, uint rva) { Line = line; Rva = rva; }
+    }
+
+    /// <summary>
+    /// Parser for the Clarion "TSWD" embedded debug blob (TopSpeed Watcom Debug).
+    /// Decodes the TOC header, module-name table, and both line-number tables.
+    /// Layout reference: docs/TSWD-format.md.
+    /// </summary>
+    public sealed class TswdDebugInfo
+    {
+        public const uint TswdMagic = 0x44575354; // 'TSWD'
+
+        private readonly byte[] _b;
+        private readonly int _base; // file offset of the blob
+
+        public int HeaderSize { get; private set; }
+        /// <summary>Module count derived from the name-offset array geometry (authoritative).</summary>
+        public int ModuleCount { get { return ModuleNames.Count; } }
+        /// <summary>Raw value of the TOC +0x24 field (NOT the array length — keep for diagnostics).</summary>
+        public int ModuleCountField { get; private set; }
+        public List<string> ModuleNames { get; private set; }
+
+        /// <summary>Line-major table (Table A): use for source-line -&gt; address (set breakpoint).</summary>
+        public List<LineRec> ByLine { get; private set; }
+
+        /// <summary>Address-major table (Table B): use for address -&gt; source-line (resolve a hit).</summary>
+        public List<LineRec> ByAddr { get; private set; }
+
+        /// <summary>Best-effort list of symbol names from the symbol string pool (not yet structured).</summary>
+        public List<string> SymbolPool { get; private set; }
+
+        /// <summary>Per-module line sub-tables (the authoritative, module-scoped line map).</summary>
+        public List<ModuleSlice> Modules { get; private set; }
+
+        // Raw TOC offsets (relative to blob base), exposed for diagnostics.
+        public int OffModuleNameArray { get; private set; }
+        public int OffModuleNamePool { get; private set; }
+        public int OffModuleRange { get; private set; }
+        public int OffLineTableA { get; private set; }
+        public int OffLineTableB { get; private set; }
+        public int OffTableAfterB { get; private set; }
+        public int OffSymbolPool { get; private set; }
+        public int OffSymbolNameArray { get; private set; }
+
+        // .text bounds (RVA) used to validate record framing; 0..uint.Max disables the check.
+        private readonly uint _textLo;
+        private readonly uint _textHi;
+
+        // Lazily-built global address index over all modules' records, sorted by RVA.
+        private List<KeyValuePair<uint, ModuleSlice>> _addrIndex;
+
+        private uint U32(int rel) { return BitConverter.ToUInt32(_b, _base + rel); }
+        private ushort U16(int rel) { return BitConverter.ToUInt16(_b, _base + rel); }
+
+        public static TswdDebugInfo FromPe(PeImage pe)
+        {
+            var e = pe.ReadFirstDebugEntry();
+            if (e.Type != TswdMagic)
+                throw new InvalidOperationException(
+                    string.Format("Debug entry type 0x{0:X8} is not TSWD — was the EXE built with Full debug info?", e.Type));
+            var t = pe.Text;
+            uint lo = t != null ? t.VirtualAddress : 0;
+            uint hi = t != null ? t.VirtualAddress + t.VirtualSize : uint.MaxValue;
+            return new TswdDebugInfo(pe.Bytes, (int)e.PointerToRawData, lo, hi);
+        }
+
+        public TswdDebugInfo(byte[] bytes, int blobOffset)
+            : this(bytes, blobOffset, 0, uint.MaxValue) { }
+
+        public TswdDebugInfo(byte[] bytes, int blobOffset, uint textLo, uint textHi)
+        {
+            _b = bytes;
+            _base = blobOffset;
+            _textLo = textLo;
+            _textHi = textHi;
+            ModuleNames = new List<string>();
+            Modules = new List<ModuleSlice>();
+            ByLine = new List<LineRec>();
+            ByAddr = new List<LineRec>();
+            SymbolPool = new List<string>();
+
+            if (U32(0) != TswdMagic)
+                throw new InvalidOperationException("Bad TSWD magic at blob offset.");
+
+            HeaderSize         = (int)U32(0x04);
+            OffModuleNameArray = (int)U32(0x08);
+            OffModuleNamePool  = (int)U32(0x0C);
+            OffModuleRange     = (int)U32(0x10);
+            OffLineTableA      = (int)U32(0x14);
+            OffLineTableB      = (int)U32(0x18);
+            OffTableAfterB     = (int)U32(0x1C);
+            OffSymbolPool      = (int)U32(0x20);
+            ModuleCountField   = (int)U32(0x24);
+            OffSymbolNameArray = (int)U32(0x28);
+
+            // --- module names: iterate the u32 offset array up to the start of the string pool.
+            // (The +0x24 count field is NOT the array length, so derive count from geometry.)
+            for (int o = OffModuleNameArray; o + 4 <= OffModuleNamePool; o += 4)
+            {
+                uint nameOff = U32(o);
+                ModuleNames.Add(ReadCString(OffModuleNamePool + (int)nameOff));
+            }
+
+            // --- per-module line sub-tables (authoritative). The +0x10 map gives each
+            //     module's blob-relative byte slice into the [LineTableA, LineTableB) region. ---
+            BuildModules();
+
+            // --- DIAGNOSTIC ONLY: flat parse of the same region. This drifts out of phase at
+            //     module boundaries (slices are not 6-byte multiples) and is unreliable — kept
+            //     only for comparison. Use Modules for real resolution. ---
+            for (int o = OffLineTableA; o + 6 <= OffLineTableB; o += 6)
+                ByLine.Add(new LineRec(U16(o), U32(o + 2)));
+            for (int o = OffLineTableB; o + 6 <= OffTableAfterB; o += 6)
+                ByAddr.Add(new LineRec(U16(o + 4), U32(o)));
+
+            // --- symbol pool: scan null-terminated strings in [SymbolPool, SymbolNameArray) ---
+            int i2 = OffSymbolPool;
+            while (i2 < OffSymbolNameArray && _base + i2 < _b.Length)
+            {
+                int start = i2;
+                while (i2 < OffSymbolNameArray && _b[_base + i2] != 0) i2++;
+                if (i2 > start) SymbolPool.Add(ReadCStringRange(start, i2));
+                i2++; // skip the NUL
+            }
+        }
+
+        // ----- module-scoped line table -----
+
+        private bool RecordValid(int line, uint rva)
+        {
+            return rva >= _textLo && rva < _textHi && line >= 1 && line < 20000;
+        }
+
+        private void BuildModules()
+        {
+            int n = ModuleNames.Count;
+            for (int i = 0; i < n; i++)
+            {
+                int o = OffModuleRange + i * 8;
+                uint s = U32(o);
+                uint e = U32(o + 4);
+                var ms = new ModuleSlice { Index = i, Name = ModuleNames[i], SliceStart = s, SliceEnd = e };
+                // Only parse slices that point INTO the line-table region. A few app modules
+                // (e.g. the MEMBER/data modules) carry small offsets below the region and would
+                // otherwise yield garbage records that pollute the address index.
+                ms.InRegion = ms.HasCode && s >= (uint)OffLineTableA && e <= (uint)OffLineTableB;
+                if (ms.InRegion)
+                {
+                    ms.Phase = DetectPhase((int)s, (int)e);
+                    for (int p = (int)s + ms.Phase; p + 6 <= (int)e; p += 6)
+                    {
+                        int line = U16(p);
+                        uint rva = U32(p + 2);
+                        if (RecordValid(line, rva))
+                            ms.Records.Add(new LineRec(line, rva));
+                    }
+                }
+                Modules.Add(ms);
+            }
+        }
+
+        /// <summary>Pick the 6-byte phase (0..5) that yields the most valid records in [start,end).</summary>
+        private int DetectPhase(int start, int end)
+        {
+            int bestPhase = 0, bestGood = -1;
+            for (int ph = 0; ph < 6; ph++)
+            {
+                int good = 0;
+                for (int p = start + ph; p + 6 <= end; p += 6)
+                    if (RecordValid(U16(p), U32(p + 2))) good++;
+                if (good > bestGood) { bestGood = good; bestPhase = ph; }
+            }
+            return bestPhase;
+        }
+
+        private void EnsureAddrIndex()
+        {
+            if (_addrIndex != null) return;
+            var list = new List<KeyValuePair<uint, ModuleSlice>>();
+            foreach (var m in Modules)
+                foreach (var r in m.Records)
+                    list.Add(new KeyValuePair<uint, ModuleSlice>(r.Rva, m));
+            list.Sort((a, b) => a.Key.CompareTo(b.Key));
+            _addrIndex = list;
+        }
+
+        public ModuleSlice FindModule(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return null;
+            // match with or without extension, case-insensitive
+            foreach (var m in Modules)
+            {
+                if (string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)) return m;
+                int dot = m.Name.LastIndexOf('.');
+                string stem = dot > 0 ? m.Name.Substring(0, dot) : m.Name;
+                if (string.Equals(stem, name, StringComparison.OrdinalIgnoreCase)) return m;
+            }
+            return null;
+        }
+
+        /// <summary>Source line -&gt; code RVAs within a specific module.</summary>
+        public List<uint> LineToRvasInModule(string moduleName, int line)
+        {
+            var list = new List<uint>();
+            var m = FindModule(moduleName);
+            if (m != null)
+                foreach (var r in m.Records) if (r.Line == line) list.Add(r.Rva);
+            return list;
+        }
+
+        /// <summary>
+        /// Find the nearest source line in a module that actually carries a code record. Clarion's
+        /// TSWD line table is sparse and coarsely attributed (many source lines have no record), so a
+        /// user-picked line frequently has no exact entry. Mirrors what VS/gdb do: prefer the smallest
+        /// recorded line &gt;= the request (forward snap), else fall back to the largest recorded line
+        /// &lt; the request. Returns the requested line if it has a record, or -1 if the module has none.
+        /// </summary>
+        public int NearestLineWithCode(string moduleName, int line)
+        {
+            var m = FindModule(moduleName);
+            if (m == null || m.Records.Count == 0) return -1;
+            int fwd = int.MaxValue, back = -1;
+            foreach (var r in m.Records)
+            {
+                if (r.Line == line) return line;            // exact hit
+                if (r.Line > line && r.Line < fwd) fwd = r.Line;
+                if (r.Line < line && r.Line > back) back = r.Line;
+            }
+            return fwd != int.MaxValue ? fwd : back;        // records>0 guarantees one side is set
+        }
+
+        /// <summary>
+        /// The distinct source lines in a module that carry a code record — i.e. the lines a
+        /// breakpoint can actually bind to. Sorted ascending; empty if the module is unknown or has
+        /// no records. The IDE gutter should offer breakpoints only on these lines (a pick on any
+        /// other line gets snapped — see <see cref="NearestLineWithCode"/>).
+        /// </summary>
+        public List<int> BreakableLines(string moduleName)
+        {
+            var set = new SortedSet<int>();
+            var m = FindModule(moduleName);
+            if (m != null) foreach (var r in m.Records) set.Add(r.Line);
+            return new List<int>(set);
+        }
+
+        /// <summary>Source line -&gt; (module, RVA) across all modules (line may exist in several).</summary>
+        public List<KeyValuePair<ModuleSlice, uint>> LineToRvasAll(int line)
+        {
+            var list = new List<KeyValuePair<ModuleSlice, uint>>();
+            foreach (var m in Modules)
+                foreach (var r in m.Records)
+                    if (r.Line == line) list.Add(new KeyValuePair<ModuleSlice, uint>(m, r.Rva));
+            return list;
+        }
+
+        /// <summary>
+        /// Resolve a code RVA to (module, line): the record with the greatest RVA &lt;= target
+        /// across all modules' correctly-framed records. This is the engine's address-&gt;line path.
+        /// </summary>
+        public bool TryResolve(uint rva, out ModuleSlice module, out int line, out uint recordRva)
+        {
+            module = null; line = 0; recordRva = 0;
+            EnsureAddrIndex();
+            if (_addrIndex.Count == 0) return false;
+
+            // binary search for greatest key <= rva
+            int lo = 0, hi = _addrIndex.Count - 1, ans = -1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) / 2;
+                if (_addrIndex[mid].Key <= rva) { ans = mid; lo = mid + 1; }
+                else hi = mid - 1;
+            }
+            if (ans < 0) return false;
+            recordRva = _addrIndex[ans].Key;
+            module = _addrIndex[ans].Value;
+            // find the line for this (rva, module) record
+            foreach (var r in module.Records)
+                if (r.Rva == recordRva) { line = r.Line; break; }
+            return true;
+        }
+
+        private string ReadCString(int rel)
+        {
+            int start = _base + rel;
+            int end = start;
+            while (end < _b.Length && _b[end] != 0) end++;
+            return Encoding.ASCII.GetString(_b, start, end - start);
+        }
+
+        private string ReadCStringRange(int relStart, int relEnd)
+        {
+            return Encoding.ASCII.GetString(_b, _base + relStart, relEnd - relStart);
+        }
+
+        /// <summary>All code RVAs generated for a given source line (across modules — may be ambiguous).</summary>
+        public List<uint> RvasForLine(int line)
+        {
+            var list = new List<uint>();
+            foreach (var r in ByLine) if (r.Line == line) list.Add(r.Rva);
+            return list;
+        }
+
+        /// <summary>
+        /// Resolve a code RVA (e.g. a breakpoint hit) to its source line: the record with the
+        /// greatest Rva &lt;= the target. Returns false if no record precedes the address.
+        /// </summary>
+        public bool TryAddrToLine(uint rva, out int line, out uint recordRva)
+        {
+            line = 0; recordRva = 0; bool found = false;
+            foreach (var r in ByAddr)
+            {
+                if (r.Rva <= rva && (!found || r.Rva > recordRva))
+                {
+                    recordRva = r.Rva; line = r.Line; found = true;
+                }
+            }
+            return found;
+        }
+    }
+}
