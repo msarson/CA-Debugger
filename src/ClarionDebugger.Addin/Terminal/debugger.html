@@ -144,6 +144,28 @@
   .datatip .dact.copy:hover { color:#9cdcfe; }
   .toast { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); z-index:80; background:#0e639c; color:#fff; padding:7px 16px; border-radius:5px; font-size:12px; box-shadow:0 4px 14px #0007; opacity:0; transition:opacity .2s; pointer-events:none; }
   .toast.show { opacity:1; }
+
+  /* ---- Settings popup (extensible modal) ---- */
+  .modal-backdrop { position:fixed; inset:0; z-index:90; background:#0008; display:none; align-items:flex-start; justify-content:center; }
+  .modal-backdrop.show { display:flex; }
+  .modal { margin-top:8vh; width:480px; max-width:92vw; max-height:80vh; overflow:auto; background:var(--popup); border:1px solid var(--popup-border); border-radius:8px; box-shadow:0 12px 40px #000a; display:flex; flex-direction:column; }
+  .modal-head { display:flex; align-items:center; justify-content:space-between; padding:11px 16px; border-bottom:1px solid var(--popup-border); font-size:13px; font-weight:700; color:var(--fg-bright); }
+  .modal-x { cursor:pointer; color:var(--fg-dim); font-size:14px; width:24px; height:24px; display:inline-flex; align-items:center; justify-content:center; border-radius:4px; }
+  .modal-x:hover { background:var(--btnhover); color:var(--fg-bright); }
+  .modal-body { padding:4px 16px 16px; }
+  .set-section { margin-top:12px; }
+  .set-h { font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); margin-bottom:4px; }
+  .set-note { font-size:11.5px; line-height:1.5; color:var(--fg-dim); margin-bottom:10px; }
+  .kb-row { display:flex; align-items:center; gap:8px; padding:4px 0; }
+  .kb-label { flex:none; width:88px; color:var(--fg); }
+  .kb-chip { flex:1; min-width:0; font-family:"Cascadia Code",Consolas,monospace; font-size:12px; background:var(--input); border:1px solid var(--popup-border); border-radius:4px; padding:3px 8px; color:var(--num); min-height:25px; display:flex; align-items:center; }
+  .kb-chip.unbound { color:#6f6f6f; font-style:italic; font-family:inherit; }
+  .kb-chip.capturing { color:#e2b341; border-color:#e2b341; font-family:inherit; }
+  .kb-act { flex:none; background:var(--accent); color:#fff; border:none; border-radius:4px; padding:4px 10px; font-size:12px; cursor:pointer; }
+  .kb-act:hover { background:var(--accent-hi); }
+  .kb-act.ghost { background:transparent; color:var(--fg-dim); border:1px solid var(--popup-border); }
+  .kb-act.ghost:hover:not([disabled]) { background:var(--btnhover); color:var(--fg); }
+  .kb-act[disabled] { opacity:.4; cursor:default; }
 </style>
 </head>
 <body>
@@ -154,15 +176,18 @@
   </div>
 
   <div class="toolbar">
-    <button class="tbtn primary" id="btnStart" title="Launch the target EXE and begin a debug session (F5)">▶ Start</button>
-    <button class="tbtn" id="btnContinue" title="Resume execution until the next breakpoint or exception (F5)">▶ Continue</button>
-    <button class="tbtn" id="btnStepOver" title="Execute the current line, stepping over any procedure calls (F10)">⤼ Step Over</button>
-    <button class="tbtn" id="btnStepInto" title="Execute the current line, stepping into any procedure call (F11)">⤓ Step Into</button>
-    <button class="tbtn" id="btnStepOut" title="Run until the current procedure returns to its caller (Shift+F11)">⤒ Step Out</button>
+    <button class="tbtn primary" id="btnStart" title="Launch the target EXE and begin a debug session">▶ Start</button>
+    <button class="tbtn" id="btnContinue" title="Resume execution until the next breakpoint or exception">▶ Continue</button>
+    <button class="tbtn" id="btnStepOver" title="Execute the current line, stepping over any procedure calls">⤼ Step Over</button>
+    <button class="tbtn" id="btnStepInto" title="Execute the current line, stepping into any procedure call">⤓ Step Into</button>
+    <button class="tbtn" id="btnStepOut" title="Run until the current procedure returns to its caller">⤒ Step Out</button>
     <div class="tsep"></div>
-    <button class="tbtn" id="btnStop" style="color:#f48771" title="Terminate the debug session and the target process (Shift+F5)">■ Stop</button>
+    <button class="tbtn" id="btnStop" style="color:#f48771" title="Terminate the debug session and the target process">■ Stop</button>
     <div class="runstate idle" id="runstate"><span class="dot"></span><span id="runtext">idle</span></div>
-    <button class="tbtn" id="btnTheme" title="Toggle light / dark" style="margin-left:8px;padding:0 8px">
+    <button class="tbtn" id="btnSettings" title="Settings — keyboard shortcuts &amp; more" style="margin-left:8px;padding:0 8px">
+      <svg viewBox="0 0 24 24" width="15" height="15" style="display:block" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    </button>
+    <button class="tbtn" id="btnTheme" title="Toggle light / dark" style="margin-left:2px;padding:0 8px">
       <svg viewBox="0 0 24 24" width="15" height="15" style="display:block"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/></svg>
     </button>
   </div>
@@ -213,6 +238,14 @@
     <span class="dacts"><span class="dact" id="dtPin" title="Add to Watch"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg></span><span class="dact copy" id="dtCopy" title="Copy Value">⧉</span></span>
   </div>
   <div class="ctxmenu" id="treeMenu"><div class="mi" id="tmWatch">👁 Add to Watch</div></div>
+
+  <div class="modal-backdrop" id="settingsBackdrop">
+    <div class="modal" role="dialog" aria-label="Settings">
+      <div class="modal-head"><span>Settings</span><span class="modal-x" id="settingsClose" title="Close">✕</span></div>
+      <div class="modal-body" id="settingsBody"></div>
+    </div>
+  </div>
+
   <div class="toast" id="toast"></div>
 
 <script>
@@ -239,19 +272,97 @@
   $('btnBrowse').onclick   =()=>send('browse');
   $('exe').addEventListener('change',()=>send('setExe',$('exe').value.trim()));
 
-  // ---- keyboard shortcuts (VS Code debugger bindings) ----
-  // F5 Start/Continue · F10 Step Over · F11 Step Into · Shift+F11 Step Out · Shift+F5 Stop
+  // ---- configurable keyboard shortcuts + Settings popup ----
+  // Debug commands are unbound by default — the Clarion IDE host intercepts the usual
+  // F5/F10/F11 keys before they reach this WebView. Bind each command to an IDE-free
+  // combination via the Settings (gear) popup; bindings persist in localStorage.
+  const KB_CMDS = [
+    {id:'start',    btn:'btnStart',    label:'Start',     tip:'Launch the target EXE and begin a debug session'},
+    {id:'continue', btn:'btnContinue', label:'Continue',  tip:'Resume execution until the next breakpoint or exception'},
+    {id:'stepover', btn:'btnStepOver', label:'Step Over', tip:'Execute the current line, stepping over any procedure calls'},
+    {id:'stepinto', btn:'btnStepInto', label:'Step Into', tip:'Execute the current line, stepping into any procedure call'},
+    {id:'stepout',  btn:'btnStepOut',  label:'Step Out',  tip:'Run until the current procedure returns to its caller'},
+    {id:'stop',     btn:'btnStop',     label:'Stop',      tip:'Terminate the debug session and the target process'},
+  ];
+  let keyBinds = {};      // cmd id -> combo string (e.g. 'Ctrl+Alt+S'); absent/empty = unbound
+  let capturing = null;   // cmd id currently being rebound, or null
+
+  function loadBinds(){ try{ const j=localStorage.getItem('caDbgKeys'); keyBinds = j ? (JSON.parse(j)||{}) : {}; }catch(e){ keyBinds={}; } }
+  function saveBinds(){ try{ localStorage.setItem('caDbgKeys', JSON.stringify(keyBinds)); }catch(e){} }
+
+  // Normalize a keydown into a stable combo string; null for a lone modifier press.
+  function comboFromEvent(e){
+    const k=e.key;
+    if(k==='Control'||k==='Alt'||k==='Shift'||k==='Meta'||k==='OS'||k==='Dead') return null;
+    const parts=[];
+    if(e.ctrlKey) parts.push('Ctrl');
+    if(e.altKey)  parts.push('Alt');
+    if(e.shiftKey)parts.push('Shift');
+    if(e.metaKey) parts.push('Meta');
+    parts.push(k===' ' ? 'Space' : (k.length===1 ? k.toUpperCase() : k));
+    return parts.join('+');
+  }
+
+  function settingsOpen(){ return $('settingsBackdrop').classList.contains('show'); }
+
+  // Reflect current bindings into the toolbar button tooltips.
+  function refreshTooltips(){
+    KB_CMDS.forEach(c=>{ const b=$(c.btn); if(b) b.title = c.tip + (keyBinds[c.id] ? ' ('+keyBinds[c.id]+')' : ' (no shortcut — set in Settings)'); });
+  }
+
+  function startCapture(id){ capturing=id; if(document.activeElement&&document.activeElement.blur) document.activeElement.blur(); renderSettings(); }
+  function endCapture(){ capturing=null; renderSettings(); }
+
+  function renderSettings(){
+    let rows='';
+    KB_CMDS.forEach(c=>{
+      const cap=capturing===c.id, bind=keyBinds[c.id];
+      const chipCls = cap ? 'kb-chip capturing' : (bind ? 'kb-chip' : 'kb-chip unbound');
+      const chipTxt = cap ? 'press a key…  (Esc cancels)' : (bind || 'unbound');
+      rows += '<div class="kb-row"><span class="kb-label">'+esc(c.label)+'</span>'
+        + '<span class="'+chipCls+'">'+esc(chipTxt)+'</span>'
+        + '<button class="kb-act" data-rebind="'+c.id+'">'+(cap?'Cancel':'Rebind')+'</button>'
+        + '<button class="kb-act ghost" data-clear="'+c.id+'"'+(bind?'':' disabled')+'>Clear</button></div>';
+    });
+    $('settingsBody').innerHTML =
+      '<div class="set-section"><div class="set-h">Keyboard Shortcuts</div>'
+      + '<div class="set-note">The Clarion IDE claims F5 / F10 / F11, so debug commands ship unbound. Click <b>Rebind</b>, then press a key combination the IDE doesn\'t use.</div>'
+      + '<div class="kb-list">'+rows+'</div></div>';
+    $('settingsBody').querySelectorAll('[data-rebind]').forEach(b=>b.onclick=()=>{ const id=b.dataset.rebind; capturing===id?endCapture():startCapture(id); });
+    $('settingsBody').querySelectorAll('[data-clear]').forEach(b=>b.onclick=()=>{ const id=b.dataset.clear; delete keyBinds[id]; saveBinds(); renderSettings(); refreshTooltips(); });
+  }
+
+  function openSettings(){ renderSettings(); $('settingsBackdrop').classList.add('show'); }
+  function closeSettings(){ if(capturing) endCapture(); $('settingsBackdrop').classList.remove('show'); }
+  $('btnSettings').onclick=openSettings;
+  $('settingsClose').onclick=closeSettings;
+  $('settingsBackdrop').addEventListener('click',e=>{ if(e.target===$('settingsBackdrop')) closeSettings(); });
+
   document.addEventListener('keydown',e=>{
+    // 1) capture mode — record the next combo for the command being rebound
+    if(capturing){
+      e.preventDefault(); e.stopPropagation();
+      if(e.key==='Escape'){ endCapture(); return; }
+      const combo=comboFromEvent(e); if(!combo) return;          // wait for a non-modifier key
+      const clash=KB_CMDS.find(c=>c.id!==capturing && keyBinds[c.id]===combo);
+      if(clash){ toast('"'+combo+'" is already bound to '+clash.label); return; }
+      keyBinds[capturing]=combo; saveBinds(); capturing=null; renderSettings(); refreshTooltips();
+      return;
+    }
+    // 2) while Settings is open, Esc closes it and debug keys stay inert
+    if(settingsOpen()){ if(e.key==='Escape'){ e.preventDefault(); closeSettings(); } return; }
+    // 3) normal dispatch — fire the command bound to this combo if its button is enabled
     const t=e.target;
     if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.isContentEditable)) return;
-    let id=null;
-    if(e.key==='F5')        id = e.shiftKey ? 'btnStop' : (paused ? 'btnContinue' : 'btnStart');
-    else if(e.key==='F10')  id = 'btnStepOver';
-    else if(e.key==='F11')  id = e.shiftKey ? 'btnStepOut' : 'btnStepInto';
-    if(!id) return;
+    const combo=comboFromEvent(e); if(!combo) return;
+    const matches=KB_CMDS.filter(c=>keyBinds[c.id]===combo);
+    if(!matches.length) return;
     e.preventDefault();
-    const b=$(id); if(b&&!b.disabled) b.click();
+    const c=matches.find(c=>{ const b=$(c.btn); return b && !b.disabled; }) || matches[0];
+    const b=$(c.btn); if(b && !b.disabled) b.click();
   });
+
+  loadBinds(); refreshTooltips();
 
   // ---- theme toggle (persisted) ----
   function applyTheme(t){ document.body.classList.toggle('light', t==='light'); try{ localStorage.setItem('caDbgTheme',t); }catch(e){} }
