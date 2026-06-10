@@ -18,3 +18,7 @@ Thumbs.db
 
 # Claude Code / MultiTerminal local tooling state (keep out of the public repo)
 .claude/
+
+# Installer build artifacts (staged payloads + compiled setup .exe)
+installer/staging/
+installer/output/

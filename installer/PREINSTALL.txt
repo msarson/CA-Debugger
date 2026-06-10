@@ -1,0 +1,20 @@
+CA Debugger — a modern source-level debugger for the Clarion IDE.
+
+Before you install:
+
+  * Close the Clarion IDE. The installer copies files into your Clarion
+    install's accessory\addins folder; an open IDE can lock them.
+
+  * Microsoft Edge WebView2 Runtime is required (the debugger pad UI runs in
+    WebView2). Most up-to-date Windows machines already have it. If not, the
+    installer will warn you and you can get it from:
+    https://developer.microsoft.com/en-us/microsoft-edge/webview2/
+
+  * This installer can target Clarion 10, 11, and 12. It will auto-detect your
+    installed versions on the next page; you choose which to install into.
+
+After installing, open the Clarion IDE and press Ctrl+Alt+G (or use
+Tools -> CA Debugger) to open the debugger pad.
+
+Note: your target application must be compiled with FULL debug information for
+the debugger to resolve source lines and variables.
