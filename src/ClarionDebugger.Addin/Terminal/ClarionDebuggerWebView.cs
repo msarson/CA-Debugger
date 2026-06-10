@@ -188,7 +188,14 @@ namespace ClarionDebugger.Terminal
                 _svc.RequestStack();
                 foreach (var name in _watched) _svc.Watch(name);
 
-                if (!string.IsNullOrEmpty(p.ResolvedPath)) TryJump(p.ResolvedPath, p.Line);
+                if (!string.IsNullOrEmpty(p.ResolvedPath))
+                {
+                    TryJump(p.ResolvedPath, p.Line);
+                    // JumpToCurrentLine activates the Clarion editor and grabs keyboard focus, so the
+                    // next configured debug shortcut would be handled by the editor instead of this
+                    // pane. Return focus to our pad so stepping shortcuts keep working in a loop.
+                    ReturnFocusToPad();
+                }
             });
         }
 
@@ -309,6 +316,30 @@ namespace ClarionDebugger.Terminal
         private static void TryJump(string path, int line)
         {
             try { ICSharpCode.SharpDevelop.Debugging.DebuggerService.JumpToCurrentLine(path, line, 1, line, 1); }
+            catch { }
+        }
+
+        /// <summary>
+        /// After TryJump moves the Clarion editor to the current line (which steals keyboard focus),
+        /// bring the debugger pad back to front and refocus the WebView so the next configured
+        /// shortcut is delivered to the debugger page rather than the Clarion editor. Posted via
+        /// BeginInvoke so it runs after the editor's activation has settled.
+        /// </summary>
+        private void ReturnFocusToPad()
+        {
+            try
+            {
+                BeginInvoke((Action)(() =>
+                {
+                    try
+                    {
+                        var pad = ICSharpCode.SharpDevelop.Gui.WorkbenchSingleton.Workbench.GetPad(typeof(ClarionDebuggerPad));
+                        if (pad != null) pad.BringPadToFront();
+                        _webView.Focus();
+                    }
+                    catch { }
+                }));
+            }
             catch { }
         }
 
