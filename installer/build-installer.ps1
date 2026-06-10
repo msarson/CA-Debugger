@@ -5,19 +5,32 @@
 # stages the version-independent ClarionDbg engine once, then compiles the Inno
 # Setup script into installer\output\.
 #
-# Usage: .\build-installer.ps1 [-Versions 12,11,10] [-NoBuild]
+# Usage: .\build-installer.ps1 [-Versions 12,11,10] [-NoBuild] [-Sign]
 #
 #   -Versions   Which Clarion versions to include (default: all that are installed).
 #   -NoBuild    Skip MSBuild; (re)stage from existing build output and compile only.
+#   -Sign       Authenticode-sign the staged binaries and the finished installer
+#               with the Sectigo EV cert (Kennewick Computer Company). Requires the
+#               EV dongle plugged in.
 #
 # Requires: Visual Studio 2022 / MSBuild, Inno Setup 6, and the Clarion install
 # root for every version being built (its \bin\ICSharpCode.*.dll are referenced
-# at compile time).
+# at compile time). For -Sign: Windows SDK signtool + the EV dongle.
 
 param(
     [int[]]$Versions,
-    [switch]$NoBuild
+    [switch]$NoBuild,
+    [switch]$Sign
 )
+
+# Sectigo EV cert: "Kennewick Computer Company". Target it explicitly by SHA1
+# thumbprint — `signtool /a` can silently fall back to another cert (e.g. an
+# expired self-signed one) if the EV dongle is unplugged, producing an
+# "Unknown Publisher" build. If the cert is reissued, look up the new thumbprint:
+#   Get-ChildItem Cert:\CurrentUser\My | Where Subject -like '*Kennewick*' | Select Thumbprint
+$SignThumbprint = '85C3D22C215029A9F59EFF775720446F3B12FE3A'
+$SignSubject    = 'Kennewick Computer Company'
+$TimestampUrl   = 'http://timestamp.sectigo.com'
 
 $ErrorActionPreference = "Stop"
 $InstallerDir = $PSScriptRoot
@@ -58,8 +71,36 @@ function Get-VersionRoot([int]$ver) {
     return @($VersionRoots[$ver]) | Where-Object { Test-Path (Join-Path $_ "bin\ICSharpCode.Core.dll") } | Select-Object -First 1
 }
 
+function Resolve-SignTool {
+    $found = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Filter 'signtool.exe' -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -like '*x64*' } |
+        Sort-Object { $_.Directory.Parent.Name } -Descending |
+        Select-Object -First 1 -ExpandProperty FullName
+    if (-not $found) { throw "signtool.exe not found. Install the Windows 10/11 SDK." }
+    return $found
+}
+
+# Sign one file with the EV cert. Retries with backoff — the Sectigo timestamp
+# server intermittently rejects rapid successive requests, which is transient.
+function Sign-File([string]$signtool, [string]$path, [string]$desc) {
+    Write-Host "  signing $([IO.Path]::GetFileName($path))..." -ForegroundColor DarkCyan
+    $maxAttempts = 5
+    for ($i = 1; $i -le $maxAttempts; $i++) {
+        $out = & $signtool sign /sha1 $SignThumbprint /fd sha256 /tr $TimestampUrl /td sha256 /d $desc $path 2>&1
+        if ($LASTEXITCODE -eq 0) { return }
+        if ($i -lt $maxAttempts) {
+            Write-Host "    attempt $i failed (likely timestamp rate-limit); retrying..." -ForegroundColor DarkYellow
+            Start-Sleep -Seconds (2 * $i)
+        } else {
+            Write-Host ($out | Out-String) -ForegroundColor Red
+            throw "signtool failed for $path after $maxAttempts attempts"
+        }
+    }
+}
+
 $MSBuild = Resolve-MSBuild
 $ISCC    = Resolve-ISCC
+$SignTool = if ($Sign) { Resolve-SignTool } else { $null }
 
 # Decide which versions to build: requested, or every one with an install root present.
 if (-not $Versions) { $Versions = @(12, 11, 10) }
@@ -126,6 +167,16 @@ foreach ($b in $Build) {
     Write-Host "  staged Clarion $($b.Ver) addin ($dest)" -ForegroundColor Green
 }
 
+# --- Sign staged binaries (before they are compressed into the installer) ---
+if ($Sign) {
+    Write-Host "`nSigning staged binaries..." -ForegroundColor Yellow
+    Sign-File $SignTool (Join-Path $EngineStage "ClarionDbg.exe") "CA Debugger Engine"
+    Sign-File $SignTool (Join-Path $EngineStage "ClarionDbg.Core.dll") "CA Debugger Engine"
+    foreach ($b in $Build) {
+        Sign-File $SignTool (Join-Path (Join-Path $StageDir "C$($b.Ver)") "ClarionDebugger.dll") "CA Debugger Addin"
+    }
+}
+
 # --- Compile installer ---
 if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
 Write-Host "`nCompiling installer..." -ForegroundColor Yellow
@@ -133,8 +184,27 @@ Write-Host "`nCompiling installer..." -ForegroundColor Yellow
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed." }
 
 $exe = Get-ChildItem $OutputDir -Filter "*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+
+# --- Sign the installer itself, then verify the signer is the expected cert ---
+if ($Sign -and $exe) {
+    Write-Host "`nSigning installer..." -ForegroundColor Yellow
+    Sign-File $SignTool $exe.FullName "CA Debugger Installer"
+
+    # Confirm the signature came from the EV cert (not a stale fallback). Don't use
+    # `signtool verify /pa` — its machine root store can lack the chain and report
+    # false negatives. Check the signer subject instead.
+    $sig = Get-AuthenticodeSignature $exe.FullName
+    if ($sig.SignerCertificate -and $sig.SignerCertificate.Subject -like "*$SignSubject*") {
+        Write-Host "  OK (signed by $($sig.SignerCertificate.Subject.Split(',')[0]))" -ForegroundColor Green
+    } else {
+        $actual = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '(no signer cert)' }
+        throw "Installer signed with WRONG certificate: $actual. Expected '$SignSubject'. Plug in the Sectigo EV dongle and rebuild."
+    }
+}
+
 Write-Host "`n=== Build Complete ===" -ForegroundColor Green
 if ($exe) {
     Write-Host "Installer: $($exe.FullName)"
     Write-Host "Size: $([math]::Round($exe.Length / 1MB, 2)) MB"
+    if ($Sign) { Write-Host "Signed:    yes (Kennewick Computer Company)" -ForegroundColor Green }
 }
