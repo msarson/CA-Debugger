@@ -83,3 +83,43 @@ Both appear to be the same tractable TSWD structure — see `docs/TSWD-format.md
 - `C:\Clarion12\bin\Cladb.exe` — working reference decoder of TSWD
 - `C:\Clarion12\bin\ClaDebugger.chm` — debugger help / format notes
 - Test binary: `C:\Users\Public\Documents\SoftVelocity\Clarion11\Examples\HowToClarion\Browses\clbrws.exe` (Full debug build)
+
+## Documentation
+
+- **[User Guide](docs/user-guide.md)** — installing, opening the pad, setting
+  breakpoints, watches, shortcuts, theming, and troubleshooting.
+- [Feasibility investigation](docs/feasibility-investigation.md) — the spike that
+  proved this was buildable.
+- [TSWD format notes](docs/TSWD-format.md) — the Clarion debug-symbol format.
+
+## Building from source
+
+Requires **Visual Studio 2022 / MSBuild** with the .NET Framework 4.8 targeting
+pack. The engine and addin target **.NET Framework 4.8 (x86)**.
+
+```powershell
+.\deploy-addin.ps1 -Version 12      # build + deploy to a Clarion install (10 | 11 | 12 | all)
+```
+
+Use `-Kill` to stop a running IDE first, or `-NoBuild` to deploy existing output.
+
+## Built with
+
+- **C# / .NET Framework 4.8 (x86)** — the `ClarionDbg` debug engine (`Core` + CLI)
+  and the IDE addin.
+- **Win32 Debugging API** — `CreateProcess(DEBUG_ONLY_THIS_PROCESS)`,
+  `WaitForDebugEvent`, INT3 breakpoints, thread context.
+- **WebView2** (HTML / CSS / JavaScript) — the debugger pad front-end.
+- **PowerShell** — build & deployment tooling.
+
+## Authors
+
+- **ClarionLive** — [github.com/ClarionLive](https://github.com/ClarionLive)
+- Maintainer: [@peterparker57](https://github.com/peterparker57)
+
+Contributions and issues are welcome via the
+[GitHub repository](https://github.com/ClarionLive/CA-Debugger).
+
+## License
+
+Released under the **MIT License** — see [LICENSE](LICENSE).
