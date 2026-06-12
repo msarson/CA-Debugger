@@ -262,6 +262,37 @@ tag 0x0C  — member/child symbol (record field, class property, local):
 - `parentRef` of a tag-0C record points at the owning symbol's record (same link-space);
   tag-04 records carry the `+0x28` module backref instead (same module binding as procs).
 
+#### Child-pointer convention — SOLVED (2026-06, cross-validated on another Clarion 11 build)
+
+The piece left open above ("exact base convention still to pin down") is decoded. A GROUP/
+RECORD's type info is `00 08 <u32 size> <u32 count> <u32 childptr × count>`, and each child
+field record is located at:
+
+```
+child_abs = tbl2C + childptr        (childptrs listed in declaration order)
+```
+
+i.e. the base is **`tbl2C` itself**, which is `linkBase + 0x12` (the doc already notes
+`linkBase ≈ tbl2C − 0x12`). That offset of `0x12` is why the `linkBase ± 2` candidates in
+`spikes/tswd-datasym6.ps1` never resolved — the children sit `0x12` further on.
+
+Confirmed: **tag-0C `linkBase` = tag-04 `linkBase` + 1** — consistent with this doc's own
+anchors (`JOBS$JOB:RECORD` tag-04 → `0x87D72`; `JOB:JOBID` tag-0C → `0x87D73` in
+`datasym5`). A tag-0C field's **byte size** can be derived from the **offset gap** to the
+next field (sorted by offset; last field runs to the group size) — no need to decode the
+string-size sub-record. Field **type** is the type-info code byte (`0x11` signed int,
+`0x12` unsigned/BYTE, `0x18` STRING, `0x16` `&`-ref, `0x13` REAL, `0x08` nested GROUP, …).
+
+Validated on a different Clarion 11 binary (`TestDashboard.exe`), e.g. the global
+`COLORMAP` (54 bytes) → `COLOR` LONG @0, `TEXT` STRING(25) @4, `TEXTKEY` STRING(25) @29;
+file-record buffers (`*$RECORD`) decode their fields likewise. The clbrws anchor to
+cross-check is `JOBS$JOB:RECORD` (4 children covering 0x37 bytes): its childptrs resolve
+via `tbl2C + childptr`.
+
+*(Found while building [clarion-pdb](https://github.com/msarson/clarion-pdb), a Clarion
+TSWD→Microsoft PDB generator that consumes the same format; this back-feeds the watch/value
+walker tracked in "Open items".)*
+
 ### Type info (observed, enum not yet complete)
 
 After the location fields comes type information, e.g.:
@@ -300,10 +331,14 @@ stack local   : proc scope → tag-0C frame offset → EBP + offset (needs pause
 ## Open items (Phase 3 — watch/value support)
 
 - **Walker**: parse the +0x2C stream systematically (record framing per tag byte, link
-  base convention, scope tree), instead of name-ref probing.
-- **Clarion type-code enumeration** — validate codes (0x08 GROUP, 0x11 SHORT?, 0x12 BYTE?,
-  0x16 ?, …) against the clbrws dictionary; map → STRING / CSTRING / PSTRING / BYTE /
-  SHORT / LONG / DECIMAL / REAL / GROUP / QUEUE etc. with picture/size.
+  base convention, scope tree), instead of name-ref probing. *(Child-base convention is
+  now solved — see "Child-pointer convention" above: `child_abs = tbl2C + childptr`.)*
+- **Clarion type-code enumeration** — validate codes against the clbrws dictionary; map →
+  STRING / CSTRING / PSTRING / BYTE / SHORT / LONG / DECIMAL / REAL / GROUP / QUEUE etc.
+  with picture/size. Cross-decode (clarion-pdb, calibration build): `0x11` signed int,
+  `0x12` unsigned int/BYTE, `0x13` IEEE REAL, `0x14` char, `0x16` `&`-ref, `0x18` STRING/
+  CSTRING/PSTRING, `0x23` DECIMAL, `0x24` PDECIMAL, `0x25` MS-binary float, `0x08` GROUP/
+  QUEUE — width by the size field. (`0x11` is signed, not specifically SHORT.)
 - **Threaded variables** — `.cwtls` statics are per-thread instances allocated at runtime;
   the blob RVA is the template. **Live-tested 2026-06-09 (John, clbrws Jobs browse):** the
   template VA reads as zeros while the same field shows a live value on screen — per-thread
