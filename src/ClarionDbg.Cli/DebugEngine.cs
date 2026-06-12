@@ -220,7 +220,7 @@ namespace ClarionDbg.Cli
                                 _seenInitialBreak = true; // OS loader breakpoint — swallow it
                                 status = Native.DBG_CONTINUE;
                             }
-                            else status = Native.DBG_CONTINUE;
+                            else status = OnProgrammaticBreak(tid); // an int3 the debuggee executed itself
                         }
                         else if (exCode == Native.EXCEPTION_SINGLE_STEP)
                         {
@@ -649,6 +649,33 @@ namespace ClarionDbg.Cli
             var drop = new List<uint>();
             foreach (var kv in _rearm) if (kv.Value.IsTemp) drop.Add(kv.Key);
             foreach (var t in drop) _rearm.Remove(t);
+        }
+
+        // ------------------------------------------------------------------ programmatic breakpoint
+
+        /// <summary>
+        /// An unexpected breakpoint after startup that we did NOT plant — the debuggee executed an
+        /// int3 itself: a hardcoded breakpoint via DebugBreak() / __debugbreak() (e.g. a Clarion
+        /// program calling kernel32 DebugBreak under IsDebuggerPresent()). This is the program asking
+        /// the debugger to stop here, so honour it and enter the pause loop.
+        ///
+        /// Unlike our planted 0xCC — where we restore the original byte and rewind EIP so the real
+        /// instruction re-executes — a hardcoded int3 IS the instruction. EIP already points past it
+        /// and must NOT be rewound (rewinding would re-run the int3 forever). We just report and, on
+        /// resume, DBG_CONTINUE so the thread proceeds. Non-interactive sessions ignore it (the legacy
+        /// behaviour) so batch runs never block.
+        /// </summary>
+        private uint OnProgrammaticBreak(uint tid)
+        {
+            if (!_interactive) return Native.DBG_CONTINUE;
+            Hits++;
+            IntPtr hThread = OpenThreadForContext(tid);
+            var ctx = NewContext();
+            bool haveCtx = hThread != IntPtr.Zero && Native.GetThreadContext(hThread, ref ctx);
+            CancelStep(); // a programmatic break supersedes any in-flight step
+            PausedWait(tid, hThread, ref ctx, haveCtx, "debugbreak");
+            if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
+            return Native.DBG_CONTINUE;
         }
 
         // ------------------------------------------------------------------ pause + command loop
