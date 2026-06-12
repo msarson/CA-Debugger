@@ -147,7 +147,7 @@ namespace ClarionDbg.Cli
 
         /// <summary>Add a module entry from an already-parsed PE/TSWD (the EXE, or a pre-loaded
         /// solution DLL). LoadBase is filled in later when the image maps.</summary>
-        private LoadedModule RegisterImageFromPe(string path, PeImage pe, TswdDebugInfo dbg)
+        private LoadedModule RegisterImageFromPe(string path, PeImage pe, TswdDebugInfo dbg, bool preloaded = false)
         {
             var m = new LoadedModule
             {
@@ -155,6 +155,7 @@ namespace ClarionDbg.Cli
                 Name = (System.IO.Path.GetFileName(path) ?? path).ToLowerInvariant(),
                 Pe = pe,
                 Dbg = dbg,
+                Preloaded = preloaded,
                 Size = pe != null ? pe.SizeOfImage : 0,
             };
             m.ResolveThreadedInfo();
@@ -173,7 +174,7 @@ namespace ClarionDbg.Cli
                 foreach (var m in _modules) if (m.Name == name) return; // already known
                 var pe = PeImage.Load(path);
                 var dbg = TswdDebugInfo.TryFromPe(pe);
-                RegisterImageFromPe(path, pe, dbg);
+                RegisterImageFromPe(path, pe, dbg, preloaded: true);
             }
             catch { /* best-effort pre-load */ }
         }
@@ -468,7 +469,6 @@ namespace ClarionDbg.Cli
             if (EmitJson) Console.WriteLine("@JSON " + Json.BpDel(canon, found.Line));
         }
 
-        /// <summary>Plant every breakpoint whose owning image is mapped (LoadBase set).</summary>
         /// <summary>A DLL mapped into the target. Resolve its path (via the file handle), parse its
         /// TSWD off disk (or reuse a pre-loaded solution entry), set its live base, and arm any
         /// breakpoints it owns. Tier 3 (no TSWD) is still registered for correct VA attribution.</summary>
@@ -533,17 +533,10 @@ namespace ClarionDbg.Cli
             }
             if (EmitJson) Console.WriteLine("@JSON " + Json.ModuleUnloaded(m));
 
-            // Keep the pre-loaded solution entry (Pe/Dbg) around but mark it unmapped; drop runtime-only.
-            bool preloaded = m.Pe != null && IsSolutionPreloaded(m);
-            if (preloaded) m.LoadBase = 0;
+            // Keep the pre-loaded solution entry (Pe/Dbg) around but mark it unmapped so it re-arms on
+            // reload; drop runtime-discovered DLLs so the table doesn't grow across load/unload churn.
+            if (m.Preloaded && m.Pe != null) m.LoadBase = 0;
             else _modules.Remove(m);
-        }
-
-        private bool IsSolutionPreloaded(LoadedModule m)
-        {
-            // A solution DLL was registered at construction; runtime-discovered DLLs were added later.
-            // We treat any module with parsed Dbg whose path we still hold as reusable on reload.
-            return m.Path != null && System.IO.File.Exists(m.Path);
         }
 
         /// <summary>Read SizeOfImage straight from the target's mapped PE header (fallback when the
