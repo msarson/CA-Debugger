@@ -416,8 +416,9 @@ namespace ClarionDbg.Core
             line = 0; moduleIdx = -1; recordRva = 0;
             if (AddrTable == null || AddrTable.Count == 0) return false;
             // Reject addresses outside this image's code section. All line records live in .text, so an
-            // address beyond it (a thread paused/broken inside the OS, e.g. ntdll!DbgBreakPoint after a
-            // DebugBreak) would otherwise falsely bind to the last record with an absurd gap.
+            // address beyond it (a thread paused inside a system call, or broken in the OS such as
+            // ntdll!DbgBreakPoint after a DebugBreak) would otherwise falsely bind to the last record
+            // with an absurd gap.
             if (_textHi != uint.MaxValue && (rva < _textLo || rva >= _textHi)) return false;
             int lo = 0, hi = AddrTable.Count - 1, ans = -1;
             while (lo <= hi)
@@ -688,8 +689,9 @@ namespace ClarionDbg.Core
         {
             sym = null;
             if (Symbols == null || Symbols.Count == 0) return false;
-            // Reject addresses outside this image's code (e.g. a thread broken inside a system call) —
-            // they would otherwise bind to the last symbol and mislabel external code as Clarion.
+            // Reject addresses outside this image's code (e.g. a paused thread in a system call, or one
+            // broken in the OS) — they would otherwise bind to the last symbol and mislabel an external
+            // frame as Clarion code.
             if (_textHi != uint.MaxValue && (rva < _textLo || rva >= _textHi)) return false;
             int lo = 0, hi = Symbols.Count - 1, ans = -1;
             while (lo <= hi)
