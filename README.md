@@ -67,9 +67,35 @@ the existing **DebugView++ fork** (`H:\DevLaptop\DebugViewPP`).
 ### Deferred (non-blocking)
 - Decode the small-offset MEMBER modules (`clbrws.clw`/`001–003`) + the line-region head `[0x624,0x711)`; reconcile Table B. Not on the startup path, so not needed for the engine — revisit for 100% line coverage.
 - Symbol record table + Clarion type codes (Phase 3 watches).
-| 2 — Stepping | Step over/into/out, continue, call-stack pane | |
+| 2 — Stepping | Step over/into/out, continue, **EBP-chain call-stack** pane | ✅ done |
 | 3 — Watches | Decode symbol table + Clarion type codes; render locals/globals/buffers/queues in WebView2; hover-eval | |
 | 4 — Polish | Conditional breakpoints, watch expressions, set-next-statement (`SetInstructionPointer`) | |
+
+### Recently landed (engine)
+
+- **Multi-DLL debugging foundation.** The engine now tracks every image mapped into the
+  target (EXE + DLLs) in a module table. All live-address math is rebased per-image, so
+  breakpoints, hits, and stack frames resolve correctly across DLL boundaries — not just in
+  the main EXE. Solution DLLs named by the host are pre-parsed so their breakpoints bind
+  before launch; runtime-discovered DLLs register on load and drop cleanly on unload.
+- **Cleaner call stack.** Frames are walked via the EBP chain (with an at-entry caller
+  frame and monotonic-frame guards), replacing the old over-inclusive stack scan.
+- **Pause / break-into.** A running target — stuck in a loop or idling in its message pump —
+  can now be paused on demand. The engine injects a break via `DebugBreakProcess`, then
+  reports the app thread actually in Clarion code (across any loaded module). A Pause button
+  in the pad is enabled only while running.
+- **Honour hardcoded breakpoints.** An `int3` the program executes itself —
+  `DebugBreak()` / `__debugbreak()` (e.g. a Clarion `DebugBreak` under `IsDebuggerPresent()`) —
+  is now honoured as a "break here" instead of being swallowed. EIP is handled correctly (a
+  hardcoded `int3` *is* the instruction, so it is not rewound).
+- **Honest reporting in external code.** When a thread is paused/broken outside the image's
+  `.text` (a system call, the OS, another module), the resolver reports external code instead
+  of mislabelling it as the nearest Clarion record; the call stack still shows the real
+  Clarion frames below.
+- **Breakpoint-removal fix.** Removing one of several gutter lines that snapped to the same
+  code line no longer leaves the shared `int3` planted and firing. Each gutter line is now an
+  independently-removable logical breakpoint, and the physical `int3` is ref-counted so it is
+  only unplanted when the last breakpoint referencing it is gone.
 
 ## Still to decode (Phase 3 prerequisite)
 
