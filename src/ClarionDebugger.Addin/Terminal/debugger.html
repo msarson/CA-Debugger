@@ -146,6 +146,16 @@
   .bp .file { color:var(--blue); } .bp .ln { color:var(--num); }
   .bp .bplink { color:var(--blue); cursor:pointer; text-decoration:underline; }
   .bp .bplink:hover { filter:brightness(1.25); }
+
+  .procfilter { padding:5px 10px 5px 14px; }
+  .procfilter input { width:100%; background:var(--input); border:1px solid var(--popup-border); color:var(--fg); border-radius:3px; padding:3px 7px; font-size:12px; outline:none; }
+  .procfilter input:focus { border-color:var(--accent-hi); }
+  .procfilter input::placeholder { color:#6f6f6f; }
+  .proc { display:flex; align-items:center; gap:8px; padding:2px 8px 2px 14px; font-size:13px; white-space:nowrap; }
+  .proc:hover { background:var(--hover); }
+  .proc .procname { color:var(--name); overflow:hidden; text-overflow:ellipsis; }
+  .proc .procfile { margin-left:auto; flex:none; color:var(--blue); cursor:pointer; text-decoration:underline; font-size:11px; }
+  .proc .procfile:hover { filter:brightness(1.25); }
   .bp .rm { margin-left:auto; flex:none; cursor:pointer; color:var(--muted,#888); opacity:.55; padding:0 4px; border-radius:3px; font-size:12px; line-height:1; }
   .bp .rm:hover { color:#fff; background:#e51400; opacity:1; }
 
@@ -238,6 +248,13 @@
       <details class="section" open data-sec="breakpoints">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Breakpoints <span class="count" id="bpCount">0</span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body" id="bpList"><div class="empty">Set breakpoints in the Clarion editor gutter.</div></div>
+      </details>
+      <details class="section" open data-sec="procedures">
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Procedures <span class="count" id="procCount">0</span><span class="hint">click a file to open at its definition</span><span class="sec-x" title="Hide section">✕</span></summary>
+        <div class="body">
+          <div class="procfilter"><input id="procFilter" placeholder="Filter procedures — type a name" autocomplete="off" /></div>
+          <div id="procList"><div class="empty">Procedures load when the target EXE is known.</div></div>
+        </div>
       </details>
       <details class="section" data-sec="registers">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Registers<span class="sec-x" title="Hide section">✕</span></summary>
@@ -396,11 +413,11 @@
   // panels stay in the DOM (display:none) so they keep receiving host updates and restore instantly.
   const MAIN=document.querySelector('.main');
   const COL_LEFT=$('colLeft'), COL_RIGHT=$('colRight'), HBAR=$('hiddenBar'), SPLITTER=$('splitter');
-  const DEFAULT_LEFT=['variables','watch','stack','breakpoints','registers'];
+  const DEFAULT_LEFT=['variables','watch','stack','breakpoints','procedures','registers'];
   const DEFAULT_RIGHT=['source','console'];
   const ALL_IDS=DEFAULT_LEFT.concat(DEFAULT_RIGHT);
-  const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', registers:'Registers', source:'Source', console:'Debug Console'};
-  const DEFAULT_COLLAPSED={variables:false, watch:false, stack:false, breakpoints:false, registers:true}; // only collapsible (<details>) panels; matches markup
+  const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', procedures:'Procedures', registers:'Registers', source:'Source', console:'Debug Console'};
+  const DEFAULT_COLLAPSED={variables:false, watch:false, stack:false, breakpoints:false, procedures:false, registers:true}; // only collapsible (<details>) panels; matches markup
   let layoutLoaded=false, dragSec=null;
 
   function secEl(id){ return MAIN ? MAIN.querySelector('[data-sec="'+id+'"]') : null; }
@@ -738,6 +755,31 @@
     if(curFile) renderBpDots();
   }
 
+  // ---- procedures (static list from the target EXE; click a file link to open the .clw at the definition) ----
+  let allProcs=[];
+  function buildProcs(procs){
+    allProcs=procs||[];
+    const el=$('procList'); if(!el) return;
+    $('procCount').textContent=allProcs.length;
+    if(!allProcs.length){ el.innerHTML='<div class="empty">Procedures load when the target EXE is known.</div>'; return; }
+    el.innerHTML='';
+    const frag=document.createDocumentFragment();
+    allProcs.forEach(p=>{ const d=document.createElement('div'); d.className='proc'; d.dataset.key=(p.name||'').toLowerCase();
+      d.innerHTML='<span class="procname">'+esc(p.name||'')+'</span>'
+        +'<span class="procfile" title="Open '+esc(p.module||'')+' at line '+p.line+'">'+esc(p.module||'')+'</span>';
+      const lk=d.querySelector('.procfile');
+      if(lk && p.module) lk.onclick=()=>send('jump', p.module+':'+p.line);   // reuses the host jump handler (resolves path + opens)
+      frag.appendChild(d); });
+    el.appendChild(frag);
+    filterProcs($('procFilter') ? $('procFilter').value : '');
+  }
+  function filterProcs(q){
+    const el=$('procList'); if(!el) return;
+    q=(q||'').trim().toLowerCase();
+    el.querySelectorAll('.proc').forEach(d=>{ d.style.display=(!q || d.dataset.key.indexOf(q)>=0)?'':'none'; });
+  }
+  (function(){ const f=$('procFilter'); if(f) f.addEventListener('input',()=>filterProcs(f.value)); })();
+
   // ---- registers ----
   function buildRegs(regs){
     const el=$('regs'); if(!regs){ el.innerHTML='<div class="empty">Registers appear when paused.</div>'; return; }
@@ -835,6 +877,7 @@
       case 'stack': buildStack(m.frames||[]); break;
       case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded); break;
       case 'bplist': buildBps(m.bps||[]); break;
+      case 'procedures': buildProcs(m.procs||[]); break;
       case 'regs': buildRegs(m.regs); break;
       case 'source': buildSource(m.file, m.proc, m.startLine, m.lines||[], m.current); break;
       case 'console': logLine(m.level, m.text); break;

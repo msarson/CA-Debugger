@@ -268,7 +268,11 @@ namespace ClarionDebugger.Terminal
                 string data = JsonVal(json, "data");
                 switch (action)
                 {
-                    case "ready": Post("{\"type\":\"runstate\",\"state\":\"idle\"}"); if (string.IsNullOrEmpty(_exe)) TryAutoResolveExe(); break;
+                    case "ready":
+                        Post("{\"type\":\"runstate\",\"state\":\"idle\"}");
+                        if (string.IsNullOrEmpty(_exe)) TryAutoResolveExe();
+                        if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);   // list procedures before running
+                        break;
                     case "start": CmdStart(); break;
                     case "continue": CmdContinue(); break;
                     case "pause": CmdPause(); break;
@@ -386,8 +390,39 @@ namespace ClarionDebugger.Terminal
                     if (!string.IsNullOrEmpty(g))
                         UI(() => Post(g.Replace("\"event\":\"globals\"", "\"type\":\"globals\"")));
                 });
+                PushProcedures(exe);   // refresh the Procedures list against the just-resolved target
             }
             catch (Exception ex) { Console("err", "start failed: " + ex.Message); }
+        }
+
+        /// <summary>Enumerate the target's procedures + methods (static parse, off the UI thread) and send
+        /// them to the page for the Procedures list. Clicking a row reuses the existing 'jump' handler, so
+        /// no new inbound action is needed. Silent on failure (the list just stays empty).</summary>
+        private void PushProcedures(string exe)
+        {
+            if (string.IsNullOrEmpty(exe)) return;
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    var procs = ClarionDebuggerService.GetProcedures(exe);
+                    var sb = new StringBuilder();
+                    sb.Append("{\"type\":\"procedures\",\"procs\":[");
+                    for (int i = 0; i < procs.Count; i++)
+                    {
+                        var p = procs[i];
+                        if (i > 0) sb.Append(',');
+                        sb.Append("{\"name\":").Append(Str(p.Name))
+                          .Append(",\"module\":").Append(Str(p.Module))
+                          .Append(",\"line\":").Append(p.Line)
+                          .Append('}');
+                    }
+                    sb.Append("]}");
+                    string json = sb.ToString();
+                    UI(() => Post(json));
+                }
+                catch { }
+            });
         }
 
         /// <summary>

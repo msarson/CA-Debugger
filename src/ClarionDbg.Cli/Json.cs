@@ -69,10 +69,15 @@ namespace ClarionDbg.Cli
             {
                 var s = syms[i];
                 if (i > 0) sb.Append(',');
+                // Definition line: resolve the proc's entry RVA against the +0x1C address table (same
+                // source the call stack uses). 0 when no record precedes the entry (not navigable).
+                int line, mi; uint rr;
+                dbg.ResolveAddr(s.EntryRva, out line, out mi, out rr);
                 sb.Append("{\"name\":").Append(Str(s.Name))
                   .Append(",\"raw\":").Append(Str(s.RawName))
                   .Append(",\"kind\":").Append(Str(s.Kind.ToString().ToLowerInvariant()))
                   .Append(",\"rva\":\"0x").Append(s.EntryRva.ToString("X")).Append('"')
+                  .Append(",\"line\":").Append(line)
                   .Append(",\"moduleIdx\":").Append(s.ModuleIdx)
                   .Append(",\"module\":").Append(Str(dbg.ModuleNameForIdx(s.ModuleIdx)))
                   .Append('}');

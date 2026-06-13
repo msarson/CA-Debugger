@@ -95,6 +95,15 @@ namespace ClarionDebugger.Services
         public string Va;           // live instance VA (hex)
     }
 
+    /// <summary>One procedure/method definition for the Procedures list: demangled name + owning module
+    /// (.clw basename) + definition line. From a static parse of the EXE (engine 'symbols' command).</summary>
+    public sealed class DebugProcedure
+    {
+        public string Name;     // demangled, e.g. SELECTJOBS, INICLASS.UPDATE
+        public string Module;   // owning .clw basename, e.g. clbrws011.clw
+        public int Line;        // 1-based definition line
+    }
+
     /// <summary>
     /// Non-invasive driver for the standalone x86 debug engine (ClarionDbg.exe). Launches it with
     /// --interactive --json, streams its @JSON events, raises typed events, and forwards commands
@@ -782,6 +791,51 @@ namespace ClarionDebugger.Services
                 }
             }
             catch { return ""; }
+        }
+
+        /// <summary>Synchronously enumerate the EXE's procedures + methods (static parse via the engine's
+        /// 'symbols' command), each with its owning module (.clw basename) and definition line. Used to
+        /// populate the Procedures list before/while running. Routines, 'other', and entries with no
+        /// resolvable source line are dropped. Empty list on failure. Sorted by name (case-insensitive).</summary>
+        public static List<DebugProcedure> GetProcedures(string targetExe)
+        {
+            var list = new List<DebugProcedure>();
+            try
+            {
+                string engine = FindEngine();
+                if (engine == null || string.IsNullOrEmpty(targetExe) || !File.Exists(targetExe)) return list;
+                var psi = new ProcessStartInfo(engine, "symbols \"" + targetExe + "\" --json")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    WorkingDirectory = Path.GetDirectoryName(targetExe)
+                };
+                string outp;
+                using (var p = Process.Start(psi))
+                {
+                    outp = p.StandardOutput.ReadToEnd();
+                    p.WaitForExit(10000);
+                }
+                int at = outp.IndexOf("@SYMBOLS ", StringComparison.Ordinal);
+                if (at < 0) return list;
+                string json = outp.Substring(at + 9);
+                // Each symbol is a brace-delimited object with no nested braces, so a simple {...} match
+                // yields one object at a time (and skips the array wrapper, which contains '[').
+                foreach (Match m in Regex.Matches(json, "\\{[^{}]*\\}"))
+                {
+                    string obj = m.Value;
+                    string kind = GetStr(obj, "kind");
+                    if (kind != "procedure" && kind != "method") continue;
+                    int line = GetInt(obj, "line");
+                    if (line <= 0) continue;
+                    list.Add(new DebugProcedure { Name = GetStr(obj, "name"), Module = GetStr(obj, "module"), Line = line });
+                }
+                list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+            }
+            catch { }
+            return list;
         }
 
         private static List<DebugBreakpoint> ParseBpList(string json)
