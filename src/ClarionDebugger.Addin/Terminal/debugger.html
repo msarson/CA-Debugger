@@ -58,6 +58,25 @@
   .body { padding:2px 0 7px; }
   .empty { padding:4px 14px; color:#6f6f6f; font-size:11px; font-style:italic; }
 
+  /* ---- rearrangeable / hideable sections ---- */
+  .section.sec-hidden { display:none; }
+  .grip { width:12px; flex:none; display:inline-flex; align-items:center; justify-content:center; margin-left:-2px; color:#5a5a5a; cursor:grab; font-size:12px; opacity:0; transition:opacity .12s; }
+  .section > summary:hover .grip { opacity:1; }
+  .grip:active { cursor:grabbing; }
+  .sec-x { margin-left:auto; flex:none; width:18px; text-align:center; line-height:1.4; color:#6f6f6f; opacity:0; cursor:pointer; font-size:11px; border-radius:3px; }
+  .section > summary:hover .sec-x { opacity:.7; }
+  .sec-x:hover { opacity:1; color:#fff; background:#e51400; }
+  .section.dragging { opacity:.45; }
+  .section.drop-before { box-shadow:inset 0 2px 0 0 var(--accent-hi); }
+  .section.drop-after  { box-shadow:inset 0 -2px 0 0 var(--accent-hi); }
+  .hidden-bar { display:none; flex-wrap:wrap; gap:5px; align-items:center; padding:7px 8px; margin-top:auto; border-top:1px solid #00000040; }
+  .hidden-bar.show { display:flex; }
+  .sec-chip { display:inline-flex; align-items:center; gap:5px; background:var(--input); border:1px solid var(--popup-border); color:var(--fg); border-radius:11px; padding:2px 9px; font-size:10px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; cursor:pointer; }
+  .sec-chip:hover { border-color:var(--accent-hi); color:var(--fg-bright); }
+  .sec-chip::before { content:"＋"; color:var(--fg-dim); font-weight:400; }
+  .reset-btn { margin-left:auto; background:transparent; border:1px solid var(--popup-border); color:var(--fg-dim); border-radius:4px; padding:2px 9px; font-size:11px; cursor:pointer; }
+  .reset-btn:hover { color:var(--fg-bright); border-color:var(--accent-hi); }
+
   .row { display:flex; align-items:center; gap:4px; padding:2px 8px 2px 14px; font-size:13px; white-space:nowrap; }
   .row:hover { background:var(--hover); }
   .row.selrow { user-select:none; cursor:default; }
@@ -182,30 +201,31 @@
   <div class="locbar" id="locbar">Not running — press Start on the IDE toolbar.</div>
 
   <div class="main">
-    <div class="sidebar">
-      <details class="section" open>
-        <summary><span class="twisty">▶</span>Variables<span class="hint" id="varsHint">file buffers</span></summary>
+    <div class="sidebar" id="sidebar">
+      <details class="section" open data-sec="variables">
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Variables<span class="hint" id="varsHint">file buffers</span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body" id="varTree"><div class="empty">Start a session to load file buffers.</div></div>
       </details>
-      <details class="section" open>
-        <summary><span class="twisty">▶</span>Watch <span class="count" id="watchCount">0</span><span class="hint">type · ☆ tree · right-click</span></summary>
+      <details class="section" open data-sec="watch">
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Watch <span class="count" id="watchCount">0</span><span class="hint">type · ☆ tree · right-click</span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body">
           <div class="addwatch"><input id="watchInput" placeholder="Add watch — type a name (e.g. JOB:JOB_DESC)" autocomplete="off" /><div class="typeahead" id="typeahead"></div></div>
           <div id="watchList"></div>
         </div>
       </details>
-      <details class="section" open>
-        <summary><span class="twisty">▶</span>Call Stack <span class="count" id="stackCount">0</span></summary>
+      <details class="section" open data-sec="stack">
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Call Stack <span class="count" id="stackCount">0</span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body" id="stackList"><div class="empty">Paused frames appear here.</div></div>
       </details>
-      <details class="section" open>
-        <summary><span class="twisty">▶</span>Breakpoints <span class="count" id="bpCount">0</span></summary>
+      <details class="section" open data-sec="breakpoints">
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Breakpoints <span class="count" id="bpCount">0</span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body" id="bpList"><div class="empty">Set breakpoints in the Clarion editor gutter.</div></div>
       </details>
-      <details class="section">
-        <summary><span class="twisty">▶</span>Registers</summary>
+      <details class="section" data-sec="registers">
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Registers<span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body regs mono" id="regs"><div class="empty">Registers appear when paused.</div></div>
       </details>
+      <div class="hidden-bar" id="hiddenBar"></div>
     </div>
 
     <div class="splitter" id="splitter"></div>
@@ -346,6 +366,116 @@
   (function(){ let t='dark'; try{ t=localStorage.getItem('caDbgTheme')||'dark'; }catch(e){}
     try{ const q=new URLSearchParams(location.search).get('theme'); if(q&&!localStorage.getItem('caDbgTheme')) t=q; }catch(e){}
     applyTheme(t); })();
+
+  // ---- sidebar layout: reorder (grip) / hide (✕ → chip) / collapse — all persisted (caDbgLayout) ----
+  // Each of the 5 sections carries a stable data-sec id. Order + hidden set + collapsed map persist to
+  // localStorage (same idiom as caDbgKeys / caDbgTheme) and restore on startup. Hidden sections stay in
+  // the DOM (just display:none) so they keep receiving host updates and restore instantly.
+  const SIDEBAR=$('sidebar'), HBAR=$('hiddenBar');
+  const DEFAULT_ORDER=['variables','watch','stack','breakpoints','registers'];
+  const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', registers:'Registers'};
+  const DEFAULT_COLLAPSED={variables:false, watch:false, stack:false, breakpoints:false, registers:true}; // matches markup (only Registers starts closed)
+  let layoutLoaded=false, dragSec=null;
+
+  function secEl(id){ return SIDEBAR.querySelector('.section[data-sec="'+id+'"]'); }
+  function allSecEls(){ return Array.from(SIDEBAR.querySelectorAll('.section')); }   // current DOM order
+  function currentOrder(){ return allSecEls().map(s=>s.dataset.sec); }
+  function isHidden(s){ return s.classList.contains('sec-hidden'); }
+  function isCustomized(){
+    const reordered=currentOrder().some((id,i)=>id!==DEFAULT_ORDER[i]);
+    if(reordered || allSecEls().some(isHidden)) return true;
+    // collapse state is persisted too, so a collapse-only divergence still counts as customized —
+    // otherwise the Reset affordance would never appear for a layout that does differ from default.
+    return DEFAULT_ORDER.some(id=>{ const el=secEl(id); return el && (!el.open)!==DEFAULT_COLLAPSED[id]; });
+  }
+
+  function loadLayout(){
+    let raw=null; try{ raw=JSON.parse(localStorage.getItem('caDbgLayout')||'null'); }catch(e){}
+    const L=(raw && typeof raw==='object') ? raw : {};
+    // order: keep known ids in saved order, then append any known section missing (forward-compat)
+    let order=Array.isArray(L.order) ? L.order.filter(id=>DEFAULT_ORDER.includes(id)) : [];
+    DEFAULT_ORDER.forEach(id=>{ if(!order.includes(id)) order.push(id); });
+    const hidden=Array.isArray(L.hidden) ? L.hidden.filter(id=>DEFAULT_ORDER.includes(id)) : [];
+    const collapsed={}; DEFAULT_ORDER.forEach(id=>{
+      collapsed[id]=(L.collapsed && typeof L.collapsed[id]==='boolean') ? L.collapsed[id] : DEFAULT_COLLAPSED[id];
+    });
+    return {order, hidden, collapsed};
+  }
+  function saveLayout(){
+    const collapsed={}; DEFAULT_ORDER.forEach(id=>{ const el=secEl(id); collapsed[id]=el?!el.open:DEFAULT_COLLAPSED[id]; });
+    const data={ v:1, order:currentOrder(), hidden:allSecEls().filter(isHidden).map(s=>s.dataset.sec), collapsed };
+    try{ localStorage.setItem('caDbgLayout', JSON.stringify(data)); }catch(e){}
+  }
+  function applyLayout(L){
+    L.order.forEach(id=>{ const el=secEl(id); if(el) SIDEBAR.insertBefore(el, HBAR); });   // reorder before the chip bar
+    DEFAULT_ORDER.forEach(id=>{ const el=secEl(id); if(el) el.open=!L.collapsed[id]; });
+    allSecEls().forEach(s=>s.classList.toggle('sec-hidden', L.hidden.includes(s.dataset.sec)));
+    renderHiddenBar();
+  }
+
+  function renderHiddenBar(){
+    HBAR.innerHTML='';
+    allSecEls().filter(isHidden).forEach(s=>{
+      const id=s.dataset.sec;
+      const chip=document.createElement('button'); chip.type='button'; chip.className='sec-chip';
+      chip.textContent=SEC_LABEL[id]||id; chip.title='Show '+(SEC_LABEL[id]||id);
+      chip.onclick=()=>showSection(id);
+      HBAR.appendChild(chip);
+    });
+    if(isCustomized()){
+      const rb=document.createElement('button'); rb.type='button'; rb.className='reset-btn';
+      rb.textContent='↺ Reset layout'; rb.title='Unhide all sections and restore the default order';
+      rb.onclick=resetLayout;
+      HBAR.appendChild(rb);
+    }
+    HBAR.classList.toggle('show', HBAR.childElementCount>0);
+  }
+
+  // Watch rows flag truncated values (.clipped) by comparing scrollWidth vs clientWidth. While the Watch
+  // section is hidden (display:none) clientWidth is 0, so background host updates mark every row clipped;
+  // recompute once the section is visible again so a restored Watch shows correct chevrons.
+  function refreshWatchClipping(){
+    document.querySelectorAll('#watchList .watchrow').forEach(row=>{
+      const v=row.querySelector('.vval'); if(v) row.classList.toggle('clipped', v.scrollWidth > v.clientWidth + 1);
+    });
+  }
+  function hideSection(id){ const el=secEl(id); if(!el) return; el.classList.add('sec-hidden'); renderHiddenBar(); saveLayout(); }
+  function showSection(id){ const el=secEl(id); if(!el) return; el.classList.remove('sec-hidden'); if(id==='watch') refreshWatchClipping(); renderHiddenBar(); saveLayout(); }
+  function resetLayout(){
+    DEFAULT_ORDER.forEach(id=>{ const el=secEl(id); if(el) SIDEBAR.insertBefore(el, HBAR); });
+    allSecEls().forEach(s=>{ s.classList.remove('sec-hidden'); s.open=!DEFAULT_COLLAPSED[s.dataset.sec]; });
+    refreshWatchClipping(); renderHiddenBar(); saveLayout();
+  }
+
+  function clearDropMarks(){ allSecEls().forEach(s=>s.classList.remove('drop-before','drop-after')); }
+  function wireSection(el){
+    const grip=el.querySelector('.grip'), x=el.querySelector('.sec-x');
+    if(grip){
+      grip.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); });          // grip click ≠ collapse toggle
+      grip.addEventListener('dragstart',e=>{ dragSec=el; el.classList.add('dragging');
+        try{ e.dataTransfer.effectAllowed='move'; e.dataTransfer.setData('text/plain', el.dataset.sec); }catch(_){} });
+      grip.addEventListener('dragend',()=>{ el.classList.remove('dragging'); clearDropMarks(); dragSec=null; });
+    }
+    if(x) x.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); hideSection(el.dataset.sec); });
+    el.addEventListener('dragover',e=>{ if(!dragSec||dragSec===el) return; e.preventDefault();
+      try{ e.dataTransfer.dropEffect='move'; }catch(_){}
+      const r=el.getBoundingClientRect(), after=e.clientY > r.top + r.height/2;
+      clearDropMarks(); el.classList.add(after?'drop-after':'drop-before'); });
+    el.addEventListener('dragleave',()=>el.classList.remove('drop-before','drop-after'));
+    el.addEventListener('drop',e=>{ if(!dragSec||dragSec===el) return; e.preventDefault();
+      const r=el.getBoundingClientRect(), after=e.clientY > r.top + r.height/2;
+      clearDropMarks();
+      SIDEBAR.insertBefore(dragSec, after ? el.nextSibling : el);
+      renderHiddenBar(); saveLayout(); });
+    el.addEventListener('toggle',()=>{ if(layoutLoaded) saveLayout(); });                       // persist collapse/expand
+  }
+
+  (function initLayout(){
+    if(!SIDEBAR||!HBAR) return;
+    allSecEls().forEach(wireSection);
+    applyLayout(loadLayout());
+    layoutLoaded=true;
+  })();
 
   // The debug controls are IDE-toolbar buttons now (greyed by the host's condition evaluator), so the
   // pad only reflects run-state in the indicator dot/text + the location bar.
