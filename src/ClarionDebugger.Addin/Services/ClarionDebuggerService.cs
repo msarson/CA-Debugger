@@ -652,11 +652,13 @@ namespace ClarionDebugger.Services
         {
             try
             {
-                // NEVER repoint a live session's resolver: while Running/Paused/Launching, _targetDir and the
-                // cached .red belong to the running target and drive its pause/stack/source resolution. A
-                // Procedures refresh after switching the active project must not poison that. Pre-run priming
-                // applies only when idle (Launch sets _targetDir authoritatively at session start).
-                if (State != DebugSessionState.Idle) return;
+                // NEVER repoint a live session's resolver: _targetDir and the cached .red belong to the
+                // running target and drive its pause/stack/source resolution. Require BOTH an Idle state AND
+                // the engine process truly gone — Stop() publishes Idle in its finally before Kill/WaitForExit
+                // prove the child exited, so a refresh during a slow teardown could otherwise repoint the
+                // resolver while the old session can still emit late events. Pre-run priming only when idle
+                // (Launch sets _targetDir authoritatively at session start).
+                if (State != DebugSessionState.Idle || IsRunning) return;
                 if (string.IsNullOrEmpty(targetExe) || !File.Exists(targetExe)) return;
                 string dir = Path.GetDirectoryName(Path.GetFullPath(targetExe));
                 if (!string.Equals(dir, _targetDir, StringComparison.OrdinalIgnoreCase)) _redFallback = null;
@@ -841,12 +843,10 @@ namespace ClarionDebugger.Services
                 string outp;
                 using (var p = Process.Start(psi))
                 {
-                    // Drain stderr async (a full stderr pipe would back-pressure stdout → deadlock). Read
-                    // stdout on a worker with a HARD byte ceiling and kill the child if it floods: a hostile
-                    // or corrupt EXE could otherwise make the engine emit an unbounded symbol blob that we'd
-                    // materialize whole. WaitForExit+Kill also bounds a wedged child that never closes stdout.
-                    // Drain-and-DISCARD stderr (content unused) through a fixed buffer so neither a full pipe
-                    // (deadlock) nor a flood (unbounded allocation) is possible — keep nothing.
+                    // Both pipes are read on workers so a hostile/corrupt EXE can neither deadlock nor
+                    // exhaust memory: stderr is drained-and-DISCARDED through a fixed buffer (content unused),
+                    // and stdout is read with a hard byte ceiling that kills the child on overflow.
+                    // WaitForExit+Kill also bounds a wedged child that never closes its pipes.
                     var errTask = System.Threading.Tasks.Task.Run(() =>
                     {
                         try { var eb = new char[8192]; while (p.StandardError.Read(eb, 0, eb.Length) > 0) { } } catch { }
