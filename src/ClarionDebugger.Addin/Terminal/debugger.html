@@ -69,7 +69,7 @@
   .section.dragging { opacity:.45; }
   .section.drop-before { box-shadow:inset 0 2px 0 0 var(--accent-hi); }
   .section.drop-after  { box-shadow:inset 0 -2px 0 0 var(--accent-hi); }
-  .hidden-bar { display:none; flex-wrap:wrap; gap:5px; align-items:center; padding:7px 8px; margin-top:auto; border-top:1px solid #00000040; }
+  .hidden-bar { display:none; flex:none; flex-wrap:wrap; gap:5px; align-items:center; padding:7px 10px; border-top:1px solid var(--border); background:var(--titlebar); }
   .hidden-bar.show { display:flex; }
   .sec-chip { display:inline-flex; align-items:center; gap:5px; background:var(--input); border:1px solid var(--popup-border); color:var(--fg); border-radius:11px; padding:2px 9px; font-size:10px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; cursor:pointer; }
   .sec-chip:hover { border-color:var(--accent-hi); color:var(--fg-bright); }
@@ -82,12 +82,17 @@
   .rsection.dragging { opacity:.45; }
   .rsection.drop-before { box-shadow:inset 0 2px 0 0 var(--accent-hi); }
   .rsection.drop-after  { box-shadow:inset 0 -2px 0 0 var(--accent-hi); }
-  .rsection[data-rsec="source"] { flex:1 1 auto; display:flex; flex-direction:column; min-height:0; min-width:0; }
-  .rightcol.src-hidden .rsection.console { flex:1 1 auto; height:auto; }   /* console grows to fill when Source is hidden */
+  .rsection[data-sec="source"]:not(.sec-hidden) { flex:1 1 auto; display:flex; flex-direction:column; min-height:120px; min-width:0; }
+  .rsection.console.grow { flex:1 1 auto; height:auto; }   /* console grows to fill when Source isn't visible in the same column */
   .srchdr:hover .grip, .console .chdr:hover .grip { opacity:1; }
   .srchdr:hover .sec-x, .console .chdr:hover .sec-x { opacity:.7; }
-  .rcol-hidden-bar { display:none; flex:none; flex-wrap:wrap; gap:5px; align-items:center; padding:7px 8px; border-top:1px solid var(--border); background:var(--panel); }
-  .rcol-hidden-bar.show { display:flex; }
+
+  /* ---- two columns: either collapses when it has no visible panels, the other then fills ---- */
+  .col { display:flex; flex-direction:column; min-height:0; overflow-y:auto; }
+  .col.col-collapsed { display:none; }
+  .splitter.hidden { display:none; }
+  .main.left-only  #colLeft  { flex:1 1 auto; }   /* right column gone → left fills width */
+  .main.right-only #colRight { flex:1 1 auto; }   /* left column gone → right fills width */
 
   .row { display:flex; align-items:center; gap:4px; padding:2px 8px 2px 14px; font-size:13px; white-space:nowrap; }
   .row:hover { background:var(--hover); }
@@ -214,7 +219,7 @@
   <div class="locbar" id="locbar">Not running — press Start on the IDE toolbar.</div>
 
   <div class="main">
-    <div class="sidebar" id="sidebar">
+    <div class="sidebar col" id="colLeft">
       <details class="section" open data-sec="variables">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Variables<span class="hint" id="varsHint">file buffers</span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body" id="varTree"><div class="empty">Start a session to load file buffers.</div></div>
@@ -238,23 +243,23 @@
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Registers<span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body regs mono" id="regs"><div class="empty">Registers appear when paused.</div></div>
       </details>
-      <div class="hidden-bar" id="hiddenBar"></div>
     </div>
 
     <div class="splitter" id="splitter"></div>
 
-    <div class="rightcol" id="rightcol">
-      <div class="rsection" data-rsec="source">
+    <div class="rightcol col" id="colRight">
+      <div class="rsection" data-sec="source">
         <div class="srchdr" id="srchdr"><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span id="srchdrText">No source — pause to show the current location.</span><span class="sec-x" title="Hide section">✕</span></div>
         <div class="src mono" id="src"></div>
       </div>
-      <div class="console rsection" data-rsec="console">
+      <div class="console rsection" data-sec="console">
         <div class="chdr"><span class="grip" draggable="true" title="Drag to reorder">⠿</span>Debug Console<span class="sec-x" title="Hide section">✕</span></div>
         <div class="clog mono" id="clog"></div>
       </div>
-      <div class="rcol-hidden-bar" id="rcolHiddenBar"></div>
     </div>
   </div>
+
+  <div class="hidden-bar" id="hiddenBar"></div>
 
   <div class="datatip" id="datatip">
     <span class="dn" id="dtName"></span><span class="dt" id="dtType"></span><span class="veq">=</span><span class="dv" id="dtVal"></span>
@@ -383,74 +388,95 @@
     try{ const q=new URLSearchParams(location.search).get('theme'); if(q&&!localStorage.getItem('caDbgTheme')) t=q; }catch(e){}
     applyTheme(t); })();
 
-  // ---- sidebar layout: reorder (grip) / hide (✕ → chip) / collapse — all persisted (caDbgLayout) ----
-  // Each of the 5 sections carries a stable data-sec id. Order + hidden set + collapsed map persist to
-  // localStorage (same idiom as caDbgKeys / caDbgTheme) and restore on startup. Hidden sections stay in
-  // the DOM (just display:none) so they keep receiving host updates and restore instantly.
-  const SIDEBAR=$('sidebar'), HBAR=$('hiddenBar');
-  const DEFAULT_ORDER=['variables','watch','stack','breakpoints','registers'];
-  const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', registers:'Registers'};
-  const DEFAULT_COLLAPSED={variables:false, watch:false, stack:false, breakpoints:false, registers:true}; // matches markup (only Registers starts closed)
-  // The right column's Source + Debug Console panels are the same kind of section (hide / reorder / persist),
-  // but they live in their own column with their own chip bar; no collapse (they don't use <details>).
-  const RIGHTCOL=$('rightcol'), RCOLBAR=$('rcolHiddenBar');
-  const DEFAULT_RCOL_ORDER=['source','console'];
-  const RSEC_LABEL={source:'Source', console:'Debug Console'};
-  let layoutLoaded=false, dragSec=null, dragRsec=null;
+  // ---- layout: drag (grip) / hide (✕ → chip) / collapse, across BOTH columns — persisted (caDbgLayout v2) ----
+  // Every panel carries a stable data-sec id and can live in either column. A panel can be dragged to any
+  // position in either column; when a column has no visible panels left it collapses so the other fills the
+  // width. Which column each panel sits in, the order within each column, the hidden set, and the collapse
+  // state of the collapsible (sidebar) panels all persist to localStorage and restore on startup. Hidden
+  // panels stay in the DOM (display:none) so they keep receiving host updates and restore instantly.
+  const MAIN=document.querySelector('.main');
+  const COL_LEFT=$('colLeft'), COL_RIGHT=$('colRight'), HBAR=$('hiddenBar'), SPLITTER=$('splitter');
+  const DEFAULT_LEFT=['variables','watch','stack','breakpoints','registers'];
+  const DEFAULT_RIGHT=['source','console'];
+  const ALL_IDS=DEFAULT_LEFT.concat(DEFAULT_RIGHT);
+  const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', registers:'Registers', source:'Source', console:'Debug Console'};
+  const DEFAULT_COLLAPSED={variables:false, watch:false, stack:false, breakpoints:false, registers:true}; // only collapsible (<details>) panels; matches markup
+  let layoutLoaded=false, dragSec=null;
 
-  function secEl(id){ return SIDEBAR.querySelector('.section[data-sec="'+id+'"]'); }
-  function allSecEls(){ return Array.from(SIDEBAR.querySelectorAll('.section')); }   // current DOM order
-  function currentOrder(){ return allSecEls().map(s=>s.dataset.sec); }
-  function isHidden(s){ return s.classList.contains('sec-hidden'); }
-  function rcolEl(id){ return RIGHTCOL ? RIGHTCOL.querySelector('.rsection[data-rsec="'+id+'"]') : null; }
-  function allRsecEls(){ return RIGHTCOL ? Array.from(RIGHTCOL.querySelectorAll('.rsection')) : []; }
-  function currentRcolOrder(){ return allRsecEls().map(s=>s.dataset.rsec); }
-  function isRcolHidden(s){ return s.classList.contains('sec-hidden'); }
+  function secEl(id){ return MAIN ? MAIN.querySelector('[data-sec="'+id+'"]') : null; }
+  function sectionsIn(col){ return Array.from(col.children).filter(el=>el.dataset && el.dataset.sec); }  // direct panel children, DOM order
+  function allSecEls(){ return ALL_IDS.map(secEl).filter(Boolean); }
+  function isHidden(el){ return el.classList.contains('sec-hidden'); }
+  function isCollapsible(el){ return el.tagName==='DETAILS'; }
+  function orderIn(col){ return sectionsIn(col).map(el=>el.dataset.sec); }
   function isCustomized(){
-    const reordered=currentOrder().some((id,i)=>id!==DEFAULT_ORDER[i]);
-    if(reordered || allSecEls().some(isHidden)) return true;
-    // right column (Source / Console) reorder or hide also counts as customized
-    if(currentRcolOrder().some((id,i)=>id!==DEFAULT_RCOL_ORDER[i]) || allRsecEls().some(isRcolHidden)) return true;
-    // collapse state is persisted too, so a collapse-only divergence still counts as customized —
-    // otherwise the Reset affordance would never appear for a layout that does differ from default.
-    return DEFAULT_ORDER.some(id=>{ const el=secEl(id); return el && (!el.open)!==DEFAULT_COLLAPSED[id]; });
+    if(orderIn(COL_LEFT).join(',')!==DEFAULT_LEFT.join(',')) return true;     // moved between columns or reordered
+    if(orderIn(COL_RIGHT).join(',')!==DEFAULT_RIGHT.join(',')) return true;
+    if(allSecEls().some(isHidden)) return true;
+    return ALL_IDS.some(id=>{ const el=secEl(id); return el && isCollapsible(el) && (!el.open)!==!!DEFAULT_COLLAPSED[id]; });
   }
 
   function loadLayout(){
     let raw=null; try{ raw=JSON.parse(localStorage.getItem('caDbgLayout')||'null'); }catch(e){}
     const L=(raw && typeof raw==='object') ? raw : {};
-    // order: keep known ids in saved order, then append any known section missing (forward-compat)
-    let order=Array.isArray(L.order) ? L.order.filter(id=>DEFAULT_ORDER.includes(id)) : [];
-    DEFAULT_ORDER.forEach(id=>{ if(!order.includes(id)) order.push(id); });
-    const hidden=Array.isArray(L.hidden) ? L.hidden.filter(id=>DEFAULT_ORDER.includes(id)) : [];
-    const collapsed={}; DEFAULT_ORDER.forEach(id=>{
-      collapsed[id]=(L.collapsed && typeof L.collapsed[id]==='boolean') ? L.collapsed[id] : DEFAULT_COLLAPSED[id];
-    });
-    let rcolOrder=Array.isArray(L.rcolOrder) ? L.rcolOrder.filter(id=>DEFAULT_RCOL_ORDER.includes(id)) : [];
-    DEFAULT_RCOL_ORDER.forEach(id=>{ if(!rcolOrder.includes(id)) rcolOrder.push(id); });
-    const rcolHidden=Array.isArray(L.rcolHidden) ? L.rcolHidden.filter(id=>DEFAULT_RCOL_ORDER.includes(id)) : [];
-    return {order, hidden, collapsed, rcolOrder, rcolHidden};
+    // Resolve the two column lists, then sanitize: drop unknown ids, de-dupe across columns, and append any
+    // missing id to its default column (forward-compat for new panels + recovery from partial saved state).
+    function sanitize(leftArr, rightArr){
+      const seen=new Set();
+      const take=arr=> (Array.isArray(arr)?arr:[]).filter(id=>ALL_IDS.includes(id) && !seen.has(id) && seen.add(id));
+      const left=take(leftArr), right=take(rightArr);
+      ALL_IDS.forEach(id=>{ if(!seen.has(id)){ (DEFAULT_LEFT.includes(id)?left:right).push(id); seen.add(id); } });
+      return {left, right};
+    }
+    let cols;
+    if(Array.isArray(L.left)||Array.isArray(L.right))            cols=sanitize(L.left, L.right);          // v2
+    else if(Array.isArray(L.order)||Array.isArray(L.rcolOrder))  cols=sanitize(L.order, L.rcolOrder);      // migrate v1
+    else                                                         cols={left:DEFAULT_LEFT.slice(), right:DEFAULT_RIGHT.slice()};
+    const hidSrc=(Array.isArray(L.hidden)?L.hidden:[]).concat(Array.isArray(L.rcolHidden)?L.rcolHidden:[]);
+    const hidden=ALL_IDS.filter(id=>hidSrc.includes(id));
+    const collapsed={}; DEFAULT_LEFT.forEach(id=>{ collapsed[id]=(L.collapsed && typeof L.collapsed[id]==='boolean') ? L.collapsed[id] : DEFAULT_COLLAPSED[id]; });
+    return {left:cols.left, right:cols.right, hidden, collapsed};
   }
   function saveLayout(){
-    const collapsed={}; DEFAULT_ORDER.forEach(id=>{ const el=secEl(id); collapsed[id]=el?!el.open:DEFAULT_COLLAPSED[id]; });
-    const data={ v:1, order:currentOrder(), hidden:allSecEls().filter(isHidden).map(s=>s.dataset.sec), collapsed,
-      rcolOrder:currentRcolOrder(), rcolHidden:allRsecEls().filter(isRcolHidden).map(s=>s.dataset.rsec) };
+    const collapsed={}; DEFAULT_LEFT.forEach(id=>{ const el=secEl(id); collapsed[id]=el?!el.open:DEFAULT_COLLAPSED[id]; });
+    const data={ v:2, left:orderIn(COL_LEFT), right:orderIn(COL_RIGHT), hidden:allSecEls().filter(isHidden).map(el=>el.dataset.sec), collapsed };
     try{ localStorage.setItem('caDbgLayout', JSON.stringify(data)); }catch(e){}
   }
   function applyLayout(L){
-    L.order.forEach(id=>{ const el=secEl(id); if(el) SIDEBAR.insertBefore(el, HBAR); });   // reorder before the chip bar
-    DEFAULT_ORDER.forEach(id=>{ const el=secEl(id); if(el) el.open=!L.collapsed[id]; });
-    allSecEls().forEach(s=>s.classList.toggle('sec-hidden', L.hidden.includes(s.dataset.sec)));
-    L.rcolOrder.forEach(id=>{ const el=rcolEl(id); if(el) RIGHTCOL.insertBefore(el, RCOLBAR); });
-    allRsecEls().forEach(s=>s.classList.toggle('sec-hidden', L.rcolHidden.includes(s.dataset.rsec)));
-    updateSrcHidden();
-    renderHiddenBar(); renderRcolBar();
+    L.left.forEach(id=>{ const el=secEl(id); if(el) COL_LEFT.appendChild(el); });    // appendChild moves the node in order
+    L.right.forEach(id=>{ const el=secEl(id); if(el) COL_RIGHT.appendChild(el); });
+    allSecEls().forEach(el=>{ const id=el.dataset.sec;
+      el.classList.toggle('sec-hidden', L.hidden.includes(id));
+      if(isCollapsible(el)) el.open=!L.collapsed[id];
+    });
+    refreshLayout();
+  }
+
+  // Recompute derived layout state (column collapse, fill, chip bar). Call after any structural change.
+  function refreshLayout(){ updateColCollapse(); updateFill(); renderHiddenBar(); }
+  function afterChange(){ refreshLayout(); refreshWatchClipping(); saveLayout(); }
+
+  function updateColCollapse(){
+    const leftEmpty=!sectionsIn(COL_LEFT).some(el=>!isHidden(el));
+    const rightEmpty=!sectionsIn(COL_RIGHT).some(el=>!isHidden(el));
+    COL_LEFT.classList.toggle('col-collapsed', leftEmpty);
+    COL_RIGHT.classList.toggle('col-collapsed', rightEmpty);
+    SPLITTER.classList.toggle('hidden', leftEmpty||rightEmpty);
+    MAIN.classList.toggle('left-only',  rightEmpty && !leftEmpty);   // right column gone → left fills
+    MAIN.classList.toggle('right-only', leftEmpty && !rightEmpty);   // left column gone → right fills
+  }
+  // Source fills its column (flex:1). When Console is visible but Source isn't in the same column, let Console
+  // grow to fill instead of sitting at its fixed height with empty space below.
+  function updateFill(){
+    const cons=secEl('console'); if(!cons) return;
+    const src=secEl('source');
+    const srcVisibleSameCol = src && !isHidden(src) && src.parentNode===cons.parentNode;
+    cons.classList.toggle('grow', !isHidden(cons) && !srcVisibleSameCol);
   }
 
   function renderHiddenBar(){
     HBAR.innerHTML='';
-    allSecEls().filter(isHidden).forEach(s=>{
-      const id=s.dataset.sec;
+    allSecEls().filter(isHidden).forEach(el=>{ const id=el.dataset.sec;
       const chip=document.createElement('button'); chip.type='button'; chip.className='sec-chip';
       chip.textContent=SEC_LABEL[id]||id; chip.title='Show '+(SEC_LABEL[id]||id);
       chip.onclick=()=>showSection(id);
@@ -458,7 +484,7 @@
     });
     if(isCustomized()){
       const rb=document.createElement('button'); rb.type='button'; rb.className='reset-btn';
-      rb.textContent='↺ Reset layout'; rb.title='Unhide all sections and restore the default order';
+      rb.textContent='↺ Reset layout'; rb.title='Restore the default two-column layout';
       rb.onclick=resetLayout;
       HBAR.appendChild(rb);
     }
@@ -473,60 +499,21 @@
       const v=row.querySelector('.vval'); if(v) row.classList.toggle('clipped', v.scrollWidth > v.clientWidth + 1);
     });
   }
-  function hideSection(id){ const el=secEl(id); if(!el) return; el.classList.add('sec-hidden'); renderHiddenBar(); saveLayout(); }
-  function showSection(id){ const el=secEl(id); if(!el) return; el.classList.remove('sec-hidden'); if(id==='watch') refreshWatchClipping(); renderHiddenBar(); saveLayout(); }
-  function resetLayout(){
-    DEFAULT_ORDER.forEach(id=>{ const el=secEl(id); if(el) SIDEBAR.insertBefore(el, HBAR); });
-    allSecEls().forEach(s=>{ s.classList.remove('sec-hidden'); s.open=!DEFAULT_COLLAPSED[s.dataset.sec]; });
-    DEFAULT_RCOL_ORDER.forEach(id=>{ const el=rcolEl(id); if(el) RIGHTCOL.insertBefore(el, RCOLBAR); });
-    allRsecEls().forEach(s=>s.classList.remove('sec-hidden'));
-    updateSrcHidden(); refreshWatchClipping(); renderHiddenBar(); renderRcolBar(); saveLayout();
-  }
-
-  // ---- right-column panels: Source + Debug Console (hide / reorder / persist, no collapse) ----
-  function updateSrcHidden(){ const s=rcolEl('source'); if(RIGHTCOL) RIGHTCOL.classList.toggle('src-hidden', !!(s && s.classList.contains('sec-hidden'))); }
-  function renderRcolBar(){
-    if(!RCOLBAR) return;
-    RCOLBAR.innerHTML='';
-    allRsecEls().filter(isRcolHidden).forEach(s=>{
-      const id=s.dataset.rsec;
-      const chip=document.createElement('button'); chip.type='button'; chip.className='sec-chip';
-      chip.textContent=RSEC_LABEL[id]||id; chip.title='Show '+(RSEC_LABEL[id]||id);
-      chip.onclick=()=>showRsec(id);
-      RCOLBAR.appendChild(chip);
-    });
-    RCOLBAR.classList.toggle('show', RCOLBAR.childElementCount>0);
-  }
-  function hideRsec(id){ const el=rcolEl(id); if(!el) return; el.classList.add('sec-hidden'); updateSrcHidden(); renderRcolBar(); renderHiddenBar(); saveLayout(); }
-  function showRsec(id){ const el=rcolEl(id); if(!el) return; el.classList.remove('sec-hidden'); updateSrcHidden();
-    // re-anchor scroll after the panel becomes visible again (scroll ops are no-ops while display:none)
+  function hideSection(id){ const el=secEl(id); if(!el) return; el.classList.add('sec-hidden'); afterChange(); }
+  function showSection(id){ const el=secEl(id); if(!el) return; el.classList.remove('sec-hidden');
+    // re-anchor scroll after a panel becomes visible again (scroll ops are no-ops while display:none)
     if(id==='source'){ const cur=document.querySelector('#src .sline.cur'); if(cur) cur.scrollIntoView({block:'center'}); }
     if(id==='console'){ const c=$('clog'); if(c) c.scrollTop=c.scrollHeight; }
-    renderRcolBar(); renderHiddenBar(); saveLayout(); }
-
-  function clearRcolDropMarks(){ allRsecEls().forEach(s=>s.classList.remove('drop-before','drop-after')); }
-  function wireRsection(el){
-    const grip=el.querySelector('.grip'), x=el.querySelector('.sec-x');
-    if(grip){
-      grip.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); });
-      grip.addEventListener('dragstart',e=>{ dragRsec=el; el.classList.add('dragging');
-        try{ e.dataTransfer.effectAllowed='move'; e.dataTransfer.setData('text/plain', el.dataset.rsec); }catch(_){} });
-      grip.addEventListener('dragend',()=>{ el.classList.remove('dragging'); clearRcolDropMarks(); dragRsec=null; });
-    }
-    if(x) x.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); hideRsec(el.dataset.rsec); });
-    el.addEventListener('dragover',e=>{ if(!dragRsec||dragRsec===el) return; e.preventDefault();
-      try{ e.dataTransfer.dropEffect='move'; }catch(_){}
-      const r=el.getBoundingClientRect(), after=e.clientY > r.top + r.height/2;
-      clearRcolDropMarks(); el.classList.add(after?'drop-after':'drop-before'); });
-    el.addEventListener('dragleave',()=>el.classList.remove('drop-before','drop-after'));
-    el.addEventListener('drop',e=>{ if(!dragRsec||dragRsec===el) return; e.preventDefault();
-      const r=el.getBoundingClientRect(), after=e.clientY > r.top + r.height/2;
-      clearRcolDropMarks();
-      RIGHTCOL.insertBefore(dragRsec, after ? el.nextSibling : el);
-      renderRcolBar(); renderHiddenBar(); saveLayout(); });
+    afterChange();
+  }
+  function resetLayout(){
+    DEFAULT_LEFT.forEach(id=>{ const el=secEl(id); if(el) COL_LEFT.appendChild(el); });
+    DEFAULT_RIGHT.forEach(id=>{ const el=secEl(id); if(el) COL_RIGHT.appendChild(el); });
+    allSecEls().forEach(el=>{ el.classList.remove('sec-hidden'); if(isCollapsible(el)) el.open=!DEFAULT_COLLAPSED[el.dataset.sec]; });
+    afterChange();
   }
 
-  function clearDropMarks(){ allSecEls().forEach(s=>s.classList.remove('drop-before','drop-after')); }
+  function clearDropMarks(){ allSecEls().forEach(el=>el.classList.remove('drop-before','drop-after')); }
   function wireSection(el){
     const grip=el.querySelector('.grip'), x=el.querySelector('.sec-x');
     if(grip){
@@ -541,18 +528,23 @@
       const r=el.getBoundingClientRect(), after=e.clientY > r.top + r.height/2;
       clearDropMarks(); el.classList.add(after?'drop-after':'drop-before'); });
     el.addEventListener('dragleave',()=>el.classList.remove('drop-before','drop-after'));
-    el.addEventListener('drop',e=>{ if(!dragSec||dragSec===el) return; e.preventDefault();
+    el.addEventListener('drop',e=>{ if(!dragSec||dragSec===el) return; e.preventDefault(); e.stopPropagation();   // stop so the column drop doesn't also fire
       const r=el.getBoundingClientRect(), after=e.clientY > r.top + r.height/2;
       clearDropMarks();
-      SIDEBAR.insertBefore(dragSec, after ? el.nextSibling : el);
-      renderHiddenBar(); saveLayout(); });
-    el.addEventListener('toggle',()=>{ if(layoutLoaded) saveLayout(); });                       // persist collapse/expand
+      el.parentNode.insertBefore(dragSec, after ? el.nextSibling : el);   // parentNode = target's column → enables cross-column moves
+      afterChange(); });
+    if(isCollapsible(el)) el.addEventListener('toggle',()=>{ if(layoutLoaded) saveLayout(); });   // persist collapse/expand
+  }
+  // Dropping in a column's empty area (below its panels) appends the dragged panel to the end of that column.
+  function wireColumn(col){
+    col.addEventListener('dragover',e=>{ if(!dragSec) return; e.preventDefault(); });
+    col.addEventListener('drop',e=>{ if(!dragSec) return; e.preventDefault(); clearDropMarks(); col.appendChild(dragSec); afterChange(); });
   }
 
   (function initLayout(){
-    if(!SIDEBAR||!HBAR) return;
+    if(!MAIN||!COL_LEFT||!COL_RIGHT||!HBAR) return;
     allSecEls().forEach(wireSection);
-    allRsecEls().forEach(wireRsection);
+    wireColumn(COL_LEFT); wireColumn(COL_RIGHT);
     applyLayout(loadLayout());
     layoutLoaded=true;
   })();
