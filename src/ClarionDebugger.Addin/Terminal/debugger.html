@@ -77,6 +77,18 @@
   .reset-btn { margin-left:auto; background:transparent; border:1px solid var(--popup-border); color:var(--fg-dim); border-radius:4px; padding:2px 9px; font-size:11px; cursor:pointer; }
   .reset-btn:hover { color:var(--fg-bright); border-color:var(--accent-hi); }
 
+  /* ---- right-column panels (Source + Debug Console) as hideable / reorderable sections ---- */
+  .rsection.sec-hidden { display:none; }
+  .rsection.dragging { opacity:.45; }
+  .rsection.drop-before { box-shadow:inset 0 2px 0 0 var(--accent-hi); }
+  .rsection.drop-after  { box-shadow:inset 0 -2px 0 0 var(--accent-hi); }
+  .rsection[data-rsec="source"] { flex:1 1 auto; display:flex; flex-direction:column; min-height:0; min-width:0; }
+  .rightcol.src-hidden .rsection.console { flex:1 1 auto; height:auto; }   /* console grows to fill when Source is hidden */
+  .srchdr:hover .grip, .console .chdr:hover .grip { opacity:1; }
+  .srchdr:hover .sec-x, .console .chdr:hover .sec-x { opacity:.7; }
+  .rcol-hidden-bar { display:none; flex:none; flex-wrap:wrap; gap:5px; align-items:center; padding:7px 8px; border-top:1px solid var(--border); background:var(--panel); }
+  .rcol-hidden-bar.show { display:flex; }
+
   .row { display:flex; align-items:center; gap:4px; padding:2px 8px 2px 14px; font-size:13px; white-space:nowrap; }
   .row:hover { background:var(--hover); }
   .row.selrow { user-select:none; cursor:default; }
@@ -135,8 +147,9 @@
   .regs { display:grid; grid-template-columns:repeat(2,1fr); gap:1px 14px; padding:4px 14px; }
   .reg { font-size:11.5px; } .reg .rn { color:var(--blue); } .reg .rv { color:var(--num); }
 
-  .srchdr { flex:none; background:var(--titlebar); border-bottom:1px solid var(--border); padding:4px 12px; font-size:12px; color:var(--fg-dim); }
+  .srchdr { flex:none; display:flex; align-items:center; gap:5px; background:var(--titlebar); border-bottom:1px solid var(--border); padding:4px 12px; font-size:12px; color:var(--fg-dim); }
   .srchdr .file { color:var(--fg); }
+  #srchdrText { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .src { flex:1; overflow:auto; padding:6px 0; background:var(--bg); min-height:0; }
   .sline { display:flex; font-size:12.5px; line-height:1.55; padding:0 12px; white-space:pre; }
   .sline .gut { width:48px; text-align:right; color:#6e7681; margin-right:14px; user-select:none; flex:none; }
@@ -145,7 +158,7 @@
   .src .srcid { cursor:help; border-radius:2px; } .src .srcid:hover { background:var(--btnhover); outline:1px solid var(--popup-border); }
 
   .console { flex:none; height:150px; border-top:1px solid var(--border); background:var(--bg); display:flex; flex-direction:column; }
-  .console .chdr { background:var(--titlebar); padding:3px 12px; font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); border-bottom:1px solid var(--border); }
+  .console .chdr { display:flex; align-items:center; gap:5px; background:var(--titlebar); padding:3px 12px; font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); border-bottom:1px solid var(--border); }
   .console .clog { flex:1; overflow:auto; padding:5px 12px; font-size:12px; }
   .clog div { white-space:pre-wrap; word-break:break-word; }
   .clog .hit { color:#73c991; } .clog .pause { color:#e2b341; } .clog .info { color:var(--fg-dim); } .clog .cmd { color:var(--name); } .clog .err { color:#f48771; }
@@ -230,13 +243,16 @@
 
     <div class="splitter" id="splitter"></div>
 
-    <div class="rightcol">
-      <div class="srchdr" id="srchdr">No source — pause to show the current location.</div>
-      <div class="src mono" id="src"></div>
-      <div class="console">
-        <div class="chdr">Debug Console</div>
+    <div class="rightcol" id="rightcol">
+      <div class="rsection" data-rsec="source">
+        <div class="srchdr" id="srchdr"><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span id="srchdrText">No source — pause to show the current location.</span><span class="sec-x" title="Hide section">✕</span></div>
+        <div class="src mono" id="src"></div>
+      </div>
+      <div class="console rsection" data-rsec="console">
+        <div class="chdr"><span class="grip" draggable="true" title="Drag to reorder">⠿</span>Debug Console<span class="sec-x" title="Hide section">✕</span></div>
         <div class="clog mono" id="clog"></div>
       </div>
+      <div class="rcol-hidden-bar" id="rcolHiddenBar"></div>
     </div>
   </div>
 
@@ -375,15 +391,26 @@
   const DEFAULT_ORDER=['variables','watch','stack','breakpoints','registers'];
   const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', registers:'Registers'};
   const DEFAULT_COLLAPSED={variables:false, watch:false, stack:false, breakpoints:false, registers:true}; // matches markup (only Registers starts closed)
-  let layoutLoaded=false, dragSec=null;
+  // The right column's Source + Debug Console panels are the same kind of section (hide / reorder / persist),
+  // but they live in their own column with their own chip bar; no collapse (they don't use <details>).
+  const RIGHTCOL=$('rightcol'), RCOLBAR=$('rcolHiddenBar');
+  const DEFAULT_RCOL_ORDER=['source','console'];
+  const RSEC_LABEL={source:'Source', console:'Debug Console'};
+  let layoutLoaded=false, dragSec=null, dragRsec=null;
 
   function secEl(id){ return SIDEBAR.querySelector('.section[data-sec="'+id+'"]'); }
   function allSecEls(){ return Array.from(SIDEBAR.querySelectorAll('.section')); }   // current DOM order
   function currentOrder(){ return allSecEls().map(s=>s.dataset.sec); }
   function isHidden(s){ return s.classList.contains('sec-hidden'); }
+  function rcolEl(id){ return RIGHTCOL ? RIGHTCOL.querySelector('.rsection[data-rsec="'+id+'"]') : null; }
+  function allRsecEls(){ return RIGHTCOL ? Array.from(RIGHTCOL.querySelectorAll('.rsection')) : []; }
+  function currentRcolOrder(){ return allRsecEls().map(s=>s.dataset.rsec); }
+  function isRcolHidden(s){ return s.classList.contains('sec-hidden'); }
   function isCustomized(){
     const reordered=currentOrder().some((id,i)=>id!==DEFAULT_ORDER[i]);
     if(reordered || allSecEls().some(isHidden)) return true;
+    // right column (Source / Console) reorder or hide also counts as customized
+    if(currentRcolOrder().some((id,i)=>id!==DEFAULT_RCOL_ORDER[i]) || allRsecEls().some(isRcolHidden)) return true;
     // collapse state is persisted too, so a collapse-only divergence still counts as customized —
     // otherwise the Reset affordance would never appear for a layout that does differ from default.
     return DEFAULT_ORDER.some(id=>{ const el=secEl(id); return el && (!el.open)!==DEFAULT_COLLAPSED[id]; });
@@ -399,18 +426,25 @@
     const collapsed={}; DEFAULT_ORDER.forEach(id=>{
       collapsed[id]=(L.collapsed && typeof L.collapsed[id]==='boolean') ? L.collapsed[id] : DEFAULT_COLLAPSED[id];
     });
-    return {order, hidden, collapsed};
+    let rcolOrder=Array.isArray(L.rcolOrder) ? L.rcolOrder.filter(id=>DEFAULT_RCOL_ORDER.includes(id)) : [];
+    DEFAULT_RCOL_ORDER.forEach(id=>{ if(!rcolOrder.includes(id)) rcolOrder.push(id); });
+    const rcolHidden=Array.isArray(L.rcolHidden) ? L.rcolHidden.filter(id=>DEFAULT_RCOL_ORDER.includes(id)) : [];
+    return {order, hidden, collapsed, rcolOrder, rcolHidden};
   }
   function saveLayout(){
     const collapsed={}; DEFAULT_ORDER.forEach(id=>{ const el=secEl(id); collapsed[id]=el?!el.open:DEFAULT_COLLAPSED[id]; });
-    const data={ v:1, order:currentOrder(), hidden:allSecEls().filter(isHidden).map(s=>s.dataset.sec), collapsed };
+    const data={ v:1, order:currentOrder(), hidden:allSecEls().filter(isHidden).map(s=>s.dataset.sec), collapsed,
+      rcolOrder:currentRcolOrder(), rcolHidden:allRsecEls().filter(isRcolHidden).map(s=>s.dataset.rsec) };
     try{ localStorage.setItem('caDbgLayout', JSON.stringify(data)); }catch(e){}
   }
   function applyLayout(L){
     L.order.forEach(id=>{ const el=secEl(id); if(el) SIDEBAR.insertBefore(el, HBAR); });   // reorder before the chip bar
     DEFAULT_ORDER.forEach(id=>{ const el=secEl(id); if(el) el.open=!L.collapsed[id]; });
     allSecEls().forEach(s=>s.classList.toggle('sec-hidden', L.hidden.includes(s.dataset.sec)));
-    renderHiddenBar();
+    L.rcolOrder.forEach(id=>{ const el=rcolEl(id); if(el) RIGHTCOL.insertBefore(el, RCOLBAR); });
+    allRsecEls().forEach(s=>s.classList.toggle('sec-hidden', L.rcolHidden.includes(s.dataset.rsec)));
+    updateSrcHidden();
+    renderHiddenBar(); renderRcolBar();
   }
 
   function renderHiddenBar(){
@@ -444,7 +478,52 @@
   function resetLayout(){
     DEFAULT_ORDER.forEach(id=>{ const el=secEl(id); if(el) SIDEBAR.insertBefore(el, HBAR); });
     allSecEls().forEach(s=>{ s.classList.remove('sec-hidden'); s.open=!DEFAULT_COLLAPSED[s.dataset.sec]; });
-    refreshWatchClipping(); renderHiddenBar(); saveLayout();
+    DEFAULT_RCOL_ORDER.forEach(id=>{ const el=rcolEl(id); if(el) RIGHTCOL.insertBefore(el, RCOLBAR); });
+    allRsecEls().forEach(s=>s.classList.remove('sec-hidden'));
+    updateSrcHidden(); refreshWatchClipping(); renderHiddenBar(); renderRcolBar(); saveLayout();
+  }
+
+  // ---- right-column panels: Source + Debug Console (hide / reorder / persist, no collapse) ----
+  function updateSrcHidden(){ const s=rcolEl('source'); if(RIGHTCOL) RIGHTCOL.classList.toggle('src-hidden', !!(s && s.classList.contains('sec-hidden'))); }
+  function renderRcolBar(){
+    if(!RCOLBAR) return;
+    RCOLBAR.innerHTML='';
+    allRsecEls().filter(isRcolHidden).forEach(s=>{
+      const id=s.dataset.rsec;
+      const chip=document.createElement('button'); chip.type='button'; chip.className='sec-chip';
+      chip.textContent=RSEC_LABEL[id]||id; chip.title='Show '+(RSEC_LABEL[id]||id);
+      chip.onclick=()=>showRsec(id);
+      RCOLBAR.appendChild(chip);
+    });
+    RCOLBAR.classList.toggle('show', RCOLBAR.childElementCount>0);
+  }
+  function hideRsec(id){ const el=rcolEl(id); if(!el) return; el.classList.add('sec-hidden'); updateSrcHidden(); renderRcolBar(); renderHiddenBar(); saveLayout(); }
+  function showRsec(id){ const el=rcolEl(id); if(!el) return; el.classList.remove('sec-hidden'); updateSrcHidden();
+    // re-anchor scroll after the panel becomes visible again (scroll ops are no-ops while display:none)
+    if(id==='source'){ const cur=document.querySelector('#src .sline.cur'); if(cur) cur.scrollIntoView({block:'center'}); }
+    if(id==='console'){ const c=$('clog'); if(c) c.scrollTop=c.scrollHeight; }
+    renderRcolBar(); renderHiddenBar(); saveLayout(); }
+
+  function clearRcolDropMarks(){ allRsecEls().forEach(s=>s.classList.remove('drop-before','drop-after')); }
+  function wireRsection(el){
+    const grip=el.querySelector('.grip'), x=el.querySelector('.sec-x');
+    if(grip){
+      grip.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); });
+      grip.addEventListener('dragstart',e=>{ dragRsec=el; el.classList.add('dragging');
+        try{ e.dataTransfer.effectAllowed='move'; e.dataTransfer.setData('text/plain', el.dataset.rsec); }catch(_){} });
+      grip.addEventListener('dragend',()=>{ el.classList.remove('dragging'); clearRcolDropMarks(); dragRsec=null; });
+    }
+    if(x) x.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); hideRsec(el.dataset.rsec); });
+    el.addEventListener('dragover',e=>{ if(!dragRsec||dragRsec===el) return; e.preventDefault();
+      try{ e.dataTransfer.dropEffect='move'; }catch(_){}
+      const r=el.getBoundingClientRect(), after=e.clientY > r.top + r.height/2;
+      clearRcolDropMarks(); el.classList.add(after?'drop-after':'drop-before'); });
+    el.addEventListener('dragleave',()=>el.classList.remove('drop-before','drop-after'));
+    el.addEventListener('drop',e=>{ if(!dragRsec||dragRsec===el) return; e.preventDefault();
+      const r=el.getBoundingClientRect(), after=e.clientY > r.top + r.height/2;
+      clearRcolDropMarks();
+      RIGHTCOL.insertBefore(dragRsec, after ? el.nextSibling : el);
+      renderRcolBar(); renderHiddenBar(); saveLayout(); });
   }
 
   function clearDropMarks(){ allSecEls().forEach(s=>s.classList.remove('drop-before','drop-after')); }
@@ -473,6 +552,7 @@
   (function initLayout(){
     if(!SIDEBAR||!HBAR) return;
     allSecEls().forEach(wireSection);
+    allRsecEls().forEach(wireRsection);
     applyLayout(loadLayout());
     layoutLoaded=true;
   })();
@@ -675,10 +755,10 @@
   }
 
   // ---- source snippet (current location) ----
-  function clearSrc(){ $('src').innerHTML=''; $('srchdr').textContent='No source — pause to show the current location.'; curFile=null; }
+  function clearSrc(){ $('src').innerHTML=''; $('srchdrText').textContent='No source — pause to show the current location.'; curFile=null; }
   function buildSource(file, proc, startLine, lines, current){
     curFile=file; curLine=current;
-    $('srchdr').innerHTML='▣ <span class="file">'+esc(file)+'</span>'+(proc?' — '+esc(proc):'');
+    $('srchdrText').innerHTML='▣ <span class="file">'+esc(file)+'</span>'+(proc?' — '+esc(proc):'');
     const src=$('src'); src.innerHTML='';
     // wrap known data-symbol names so they get the same hover data-tip as the panels
     let re=null;
