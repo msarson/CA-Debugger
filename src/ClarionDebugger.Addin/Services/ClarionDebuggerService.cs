@@ -836,14 +836,30 @@ namespace ClarionDebugger.Services
                 string outp;
                 using (var p = Process.Start(psi))
                 {
-                    // Read both pipes asynchronously and kill on timeout: ReadToEnd() before WaitForExit
-                    // can hang forever if a hostile/corrupt EXE makes the child block or flood stderr
-                    // (filling the unread pipe back-pressures stdout). Draining stderr prevents that.
-                    var outTask = p.StandardOutput.ReadToEndAsync();
+                    // Drain stderr async (a full stderr pipe would back-pressure stdout → deadlock). Read
+                    // stdout on a worker with a HARD byte ceiling and kill the child if it floods: a hostile
+                    // or corrupt EXE could otherwise make the engine emit an unbounded symbol blob that we'd
+                    // materialize whole. WaitForExit+Kill also bounds a wedged child that never closes stdout.
                     var errTask = p.StandardError.ReadToEndAsync();
+                    var sb = new System.Text.StringBuilder();
+                    const int MaxChars = 16 * 1024 * 1024;   // 16M-char ceiling on the @SYMBOLS payload
+                    var readTask = System.Threading.Tasks.Task.Run(() =>
+                    {
+                        try
+                        {
+                            var buf = new char[8192]; int rd;
+                            while ((rd = p.StandardOutput.Read(buf, 0, buf.Length)) > 0)
+                            {
+                                sb.Append(buf, 0, rd);
+                                if (sb.Length > MaxChars) { try { p.Kill(); } catch { } break; }
+                            }
+                        }
+                        catch { }
+                    });
                     if (!p.WaitForExit(10000)) { try { p.Kill(); } catch { } }
-                    try { outp = outTask.Wait(2000) ? outTask.Result : ""; } catch { outp = ""; }
-                    try { errTask.Wait(500); } catch { }   // drained (content unused) so it can't deadlock stdout
+                    try { readTask.Wait(2000); } catch { }   // let the read loop drain after exit/kill (no concurrent append after)
+                    try { errTask.Wait(500); } catch { }     // drained; content unused
+                    outp = sb.ToString();
                 }
                 int at = outp.IndexOf("@SYMBOLS ", StringComparison.Ordinal);
                 if (at < 0) return list;

@@ -444,24 +444,54 @@ namespace ClarionDbg.Core
             return list;
         }
 
-        /// <summary>Definition line for a symbol's entry RVA, constrained to the symbol's OWN module.
-        /// <see cref="ResolveAddr"/> alone can bind a proc whose entry sits below its module's +0x1C
-        /// floor (cold/init code emitted under the named entry) to the PREVIOUS module's last record —
-        /// wrong file/line. This stays within moduleIdx: the greatest same-module record at/below the
-        /// entry, else the first same-module record above it. Returns 0 when the module has no line
-        /// records (not navigable). AddrTable is sorted ascending by Rva.</summary>
-        public int LineForEntry(uint entryRva, int moduleIdx)
+        // Lazily-built indexes for fast, correct definition-line lookup (built once; this object is
+        // per-image and immutable after load): per-module AddrTable slices (each ascending by Rva), and
+        // the sorted set of symbol entry RVAs (for the next-symbol upper bound).
+        private Dictionary<int, List<AddrRec>> _addrByModule;
+        private uint[] _sortedEntries;
+        private void EnsureDefIndexes()
         {
-            if (AddrTable == null) return 0;
-            int below = 0; bool haveBelow = false;   // greatest same-module record with Rva <= entry
-            int above = 0; bool haveAbove = false;   // first same-module record with Rva > entry
-            foreach (var r in AddrTable)
-            {
-                if (r.ModuleIdx != moduleIdx) continue;
-                if (r.Rva <= entryRva) { below = r.Line; haveBelow = true; }
-                else if (!haveAbove) { above = r.Line; haveAbove = true; }
-            }
-            return haveBelow ? below : (haveAbove ? above : 0);
+            if (_addrByModule != null) return;
+            var map = new Dictionary<int, List<AddrRec>>();
+            if (AddrTable != null)
+                foreach (var r in AddrTable)   // AddrTable is sorted by Rva → each per-module slice stays sorted
+                {
+                    List<AddrRec> lst;
+                    if (!map.TryGetValue(r.ModuleIdx, out lst)) { lst = new List<AddrRec>(); map[r.ModuleIdx] = lst; }
+                    lst.Add(r);
+                }
+            int n = Symbols != null ? Symbols.Count : 0;
+            var entries = new uint[n];
+            for (int i = 0; i < n; i++) entries[i] = Symbols[i].EntryRva;
+            Array.Sort(entries);
+            _sortedEntries = entries;
+            _addrByModule = map;   // set last: makes EnsureDefIndexes idempotent under concurrent reads
+        }
+
+        /// <summary>Definition line for a procedure/method symbol. The proc OWNS [EntryRva, nextEntry);
+        /// its definition line is the FIRST same-module +0x1C record in that range. Bounding to the proc's
+        /// OWN range is what makes this correct in multi-method modules (library .clw files carry many
+        /// methods): records BELOW the entry belong to the previous proc, and records at/above the next
+        /// symbol's entry belong to the next proc. Returns 0 when the proc has no own line record (no
+        /// source / not navigable) so callers can drop it rather than misnavigate. O(log n) via the
+        /// per-module slices + sorted entry index.</summary>
+        public int DefinitionLine(ProcSymbol s)
+        {
+            if (s == null) return 0;
+            EnsureDefIndexes();
+            uint entry = s.EntryRva;
+            // upper bound = smallest symbol entry strictly greater than this one (binary upper_bound)
+            uint upper = uint.MaxValue;
+            { int lo = 0, hi = _sortedEntries.Length - 1;
+              while (lo <= hi) { int mid = (lo + hi) >> 1; if (_sortedEntries[mid] > entry) { upper = _sortedEntries[mid]; hi = mid - 1; } else lo = mid + 1; } }
+            List<AddrRec> slice;
+            if (!_addrByModule.TryGetValue(s.ModuleIdx, out slice) || slice.Count == 0) return 0;
+            // first same-module record with Rva >= entry (binary lower_bound), valid only if within [entry, upper)
+            int a = 0, b = slice.Count - 1, ans = -1;
+            while (a <= b) { int mid = (a + b) >> 1; if (slice[mid].Rva >= entry) { ans = mid; b = mid - 1; } else a = mid + 1; }
+            if (ans < 0) return 0;
+            var rec = slice[ans];
+            return rec.Rva < upper ? rec.Line : 0;
         }
 
         // ----- structured symbol table (Phase 3) -----

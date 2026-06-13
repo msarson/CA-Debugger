@@ -287,8 +287,8 @@ namespace ClarionDebugger.Terminal
                     case "jump": Jump(data); break;
                     case "openbp": OpenBp(data); break;
                     case "bpremove": RemoveBp(data); break;
-                    case "proclist":   // user asked to (re)list procedures — re-resolve the target if needed
-                        if (string.IsNullOrEmpty(_exe)) TryAutoResolveExe();
+                    case "proclist":   // user pressed ↻ — re-resolve FRESH so the list tracks a project/solution switch
+                        TryAutoResolveExe();   // (re-resolves against the active project even if _exe was already set)
                         if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);
                         else Console("info", "(no target EXE resolved yet — build the app, or open its solution)");
                         break;
