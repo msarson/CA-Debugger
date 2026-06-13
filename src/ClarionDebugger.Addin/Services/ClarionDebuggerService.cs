@@ -652,6 +652,11 @@ namespace ClarionDebugger.Services
         {
             try
             {
+                // NEVER repoint a live session's resolver: while Running/Paused/Launching, _targetDir and the
+                // cached .red belong to the running target and drive its pause/stack/source resolution. A
+                // Procedures refresh after switching the active project must not poison that. Pre-run priming
+                // applies only when idle (Launch sets _targetDir authoritatively at session start).
+                if (State != DebugSessionState.Idle) return;
                 if (string.IsNullOrEmpty(targetExe) || !File.Exists(targetExe)) return;
                 string dir = Path.GetDirectoryName(Path.GetFullPath(targetExe));
                 if (!string.Equals(dir, _targetDir, StringComparison.OrdinalIgnoreCase)) _redFallback = null;
@@ -840,7 +845,12 @@ namespace ClarionDebugger.Services
                     // stdout on a worker with a HARD byte ceiling and kill the child if it floods: a hostile
                     // or corrupt EXE could otherwise make the engine emit an unbounded symbol blob that we'd
                     // materialize whole. WaitForExit+Kill also bounds a wedged child that never closes stdout.
-                    var errTask = p.StandardError.ReadToEndAsync();
+                    // Drain-and-DISCARD stderr (content unused) through a fixed buffer so neither a full pipe
+                    // (deadlock) nor a flood (unbounded allocation) is possible — keep nothing.
+                    var errTask = System.Threading.Tasks.Task.Run(() =>
+                    {
+                        try { var eb = new char[8192]; while (p.StandardError.Read(eb, 0, eb.Length) > 0) { } } catch { }
+                    });
                     var sb = new System.Text.StringBuilder();
                     const int MaxChars = 16 * 1024 * 1024;   // 16M-char ceiling on the @SYMBOLS payload
                     var readTask = System.Threading.Tasks.Task.Run(() =>
@@ -857,9 +867,11 @@ namespace ClarionDebugger.Services
                         catch { }
                     });
                     if (!p.WaitForExit(10000)) { try { p.Kill(); } catch { } }
-                    try { readTask.Wait(2000); } catch { }   // let the read loop drain after exit/kill (no concurrent append after)
+                    bool drained = false; try { drained = readTask.Wait(2000); } catch { }
                     try { errTask.Wait(500); } catch { }     // drained; content unused
-                    outp = sb.ToString();
+                    // Read sb only once the worker has finished — never ToString() while it might still be
+                    // Appending (StringBuilder isn't thread-safe). If it didn't drain in time, take nothing.
+                    outp = drained ? sb.ToString() : "";
                 }
                 int at = outp.IndexOf("@SYMBOLS ", StringComparison.Ordinal);
                 if (at < 0) return list;
