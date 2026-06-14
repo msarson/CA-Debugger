@@ -77,25 +77,10 @@ namespace ClarionDbg.Cli
                 }
             }
 
-            // stop check: pause at the next statement boundary appropriate for the mode
-            int line = 0, mi = -1; uint recRva = 0;
-            bool resolved = m != null && m.Dbg != null && m.Dbg.ResolveAddr(rva, out line, out mi, out recRva);
-            uint gap = resolved ? rva - recRva : 0;
-            bool atRecord = resolved && gap == 0;
-            bool newStatement = atRecord && (m != _startModule || line != _startLine || mi != _startModIdx);
-            bool stop = false;
-            switch (_mode)
-            {
-                case StepMode.Into:
-                    stop = newStatement;
-                    break;
-                case StepMode.Over:
-                    stop = newStatement && ctx.Esp + ESP_SLACK >= _startEsp;
-                    break;
-                case StepMode.Out:
-                    stop = resolved && ctx.Esp > _startEsp && gap <= OUT_GAP_MAX;
-                    break;
-            }
+            // stop check: pause at the next statement boundary appropriate for the mode. Shared with the
+            // call-skip return path (OnTempBp) so a boundary that lands on a skipped call's return address
+            // is not stepped past and missed.
+            bool stop = IsStepStop(va, ctx.Esp);
 
             if (!stop && _stepCount >= MAX_STEPS)
             {
@@ -113,6 +98,30 @@ namespace ClarionDbg.Cli
             _prevVa = va;
             ctx.EFlags |= TRAP_FLAG;
             Native.SetThreadContext(hThread, ref ctx);
+        }
+
+        /// <summary>Should the active step mode stop at <paramref name="va"/> (ESP <paramref name="esp"/>)?
+        /// Shared by the single-step machine and the call-skip return path so the stop decision is identical
+        /// whether we arrive at a statement boundary by single-stepping or by a temp-BP at a call's return
+        /// address. Stops only at a record boundary (gap==0) for a different statement than the step start;
+        /// Over additionally requires the frame to be no deeper than the start.</summary>
+        private bool IsStepStop(uint va, uint esp)
+        {
+            if (_mode == StepMode.None) return false;
+            var m = ModuleAt(va);
+            uint rva = m != null ? va - m.LoadBase : va;
+            int line = 0, mi = -1; uint recRva = 0;
+            bool resolved = m != null && m.Dbg != null && m.Dbg.ResolveAddr(rva, out line, out mi, out recRva);
+            if (!resolved) return false;
+            uint gap = rva - recRva;
+            bool newStatement = gap == 0 && (m != _startModule || line != _startLine || mi != _startModIdx);
+            switch (_mode)
+            {
+                case StepMode.Into: return newStatement;
+                case StepMode.Over: return newStatement && esp + ESP_SLACK >= _startEsp;
+                case StepMode.Out:  return esp > _startEsp && gap <= OUT_GAP_MAX;
+            }
+            return false;
         }
 
         private void StopStepAndPause(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, string reason)

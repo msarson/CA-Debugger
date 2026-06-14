@@ -330,7 +330,15 @@ namespace ClarionDbg.Cli
             {
                 _temp.Remove(va);
                 _skipRunning = false;
-                if (_mode != StepMode.None && haveCtx)
+                if (_mode != StepMode.None && haveCtx && IsStepStop(va, ctx.Esp))
+                {
+                    // the skipped call returned straight onto a new statement boundary (a call as the last
+                    // op of a line → its return address is the next line's record). Stop here; otherwise we
+                    // resume stepping and trap only at the following instruction, missing the line.
+                    Native.SetThreadContext(hThread, ref ctx);   // commit the corrected EIP (=va)
+                    StopStepAndPause(tid, hThread, ref ctx, "step");
+                }
+                else if (_mode != StepMode.None && haveCtx)
                 {
                     // back at the caller — resume source-level stepping
                     _prevVa = va;
