@@ -256,7 +256,15 @@ namespace ClarionDbg.Cli
                   .Append(",\"rva\":\"0x").Append(s.Rva.ToString("X")).Append('"')
                   .Append(",\"module\":").Append(Str(dbg.ModuleNameForIdx(s.ModuleIdx)))
                   .Append(",\"fields\":[");
-                if (s.Fields != null)
+                // Prefer the byte-exact resolved type tree (recurses nested groups); fall back to the legacy
+                // flat field list for symbols whose typeRef didn't resolve to a group.
+                if (s.Type != null && s.Type.Kind == TypeKind.Group && s.Type.Members != null)
+                    for (int f = 0; f < s.Type.Members.Count; f++)
+                    {
+                        if (f > 0) sb.Append(',');
+                        AppendField(sb, s.Type.Members[f]);
+                    }
+                else if (s.Fields != null)
                     for (int f = 0; f < s.Fields.Count; f++)
                     {
                         var fl = s.Fields[f];
@@ -271,6 +279,39 @@ namespace ClarionDbg.Cli
             }
             sb.Append("]}");
             return sb.ToString();
+        }
+
+        /// <summary>Emit one resolved GROUP member as a field object, recursing nested groups into their own
+        /// "fields" array. Leaf type labels go through the shared <see cref="DebugEngine.ClarionTypeLabel"/>
+        /// so the globals tree labels types exactly like the locals panel.</summary>
+        private static void AppendField(StringBuilder sb, TypeMember mb)
+        {
+            var t = mb.Type;
+            bool group = t != null && t.Kind == TypeKind.Group;
+            byte code = 0; uint size = t != null ? t.Size : 0; int places = 0;
+            string typeName;
+            if (group) typeName = "GROUP";
+            else if (t != null && t.Kind == TypeKind.Array) typeName = "ARRAY(" + t.Length + ")";
+            else if (t != null)
+            {
+                if (t.Tag == 0x16 || t.Tag == 0x26 || t.Tag == 0x29) { code = 0x16; size = 4; }
+                else t.RenderHint(out code, out size, out places);
+                typeName = DebugEngine.ClarionTypeLabel(code, 0, size, places);
+            }
+            else typeName = null;
+
+            sb.Append("{\"name\":").Append(Str(mb.Name ?? "?"))
+              .Append(",\"offset\":").Append(mb.Offset)
+              .Append(",\"type\":\"0x").Append(code.ToString("X2")).Append('"')
+              .Append(",\"typeName\":").Append(Str(typeName))
+              .Append(",\"size\":").Append(size);
+            if (group && t.Members != null)
+            {
+                sb.Append(",\"fields\":[");
+                for (int i = 0; i < t.Members.Count; i++) { if (i > 0) sb.Append(','); AppendField(sb, t.Members[i]); }
+                sb.Append(']');
+            }
+            sb.Append('}');
         }
 
         /// <summary>Resolved data symbol for watch-by-name. typeName null = unproven code (render hex).</summary>
@@ -292,7 +333,7 @@ namespace ClarionDbg.Cli
         /// <summary>Watch-by-name value: instanceVa is the live (per-thread when threaded) address
         /// the bytes were read from; va is the link-time template address.</summary>
         public static string Watch(string name, bool found, uint templateVa, uint instanceVa, bool threaded,
-                                   byte typeCode, string typeName, uint size, byte[] bytes, int read)
+                                   byte typeCode, string typeName, uint size, string value, byte[] bytes, int read)
         {
             if (!found)
                 return "{\"event\":\"watch\",\"name\":" + Str(name) + ",\"found\":false}";
@@ -305,6 +346,7 @@ namespace ClarionDbg.Cli
               .Append(",\"type\":\"0x").Append(typeCode.ToString("X2")).Append('"')
               .Append(",\"typeName\":").Append(Str(typeName))
               .Append(",\"size\":").Append(size)
+              .Append(",\"value\":").Append(Str(value))   // engine-formatted (shared with the Locals panel)
               .Append(",\"read\":").Append(read)
               .Append(",\"bytes\":\"");
             for (int i = 0; i < read; i++) sb.Append(bytes[i].ToString("X2"));

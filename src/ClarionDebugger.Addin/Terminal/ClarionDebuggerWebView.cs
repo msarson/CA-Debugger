@@ -56,6 +56,8 @@ namespace ClarionDebugger.Terminal
             _svc.Resumed               += OnSvcResumed;
             _svc.HitReceived           += OnSvcHit;
             _svc.StackReceived         += OnSvcStack;
+            _svc.LocalsReceived        += OnSvcLocals;
+            _svc.ModuleDataReceived    += OnSvcModuleData;
             _svc.WatchReceived         += OnSvcWatch;
             _svc.BreakpointSet         += OnSvcBreakpointSet;
             _svc.BreakpointRemoved     += OnSvcBreakpointRemoved;
@@ -85,6 +87,8 @@ namespace ClarionDebugger.Terminal
             _svc.Resumed                -= OnSvcResumed;
             _svc.HitReceived            -= OnSvcHit;
             _svc.StackReceived          -= OnSvcStack;
+            _svc.LocalsReceived         -= OnSvcLocals;
+            _svc.ModuleDataReceived     -= OnSvcModuleData;
             _svc.WatchReceived          -= OnSvcWatch;
             _svc.BreakpointSet          -= OnSvcBreakpointSet;
             _svc.BreakpointRemoved      -= OnSvcBreakpointRemoved;
@@ -114,6 +118,35 @@ namespace ClarionDebugger.Terminal
         private void OnSvcResumed(string mode) => UI(() => { Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
         private void OnSvcHit(DebugHit hit) => UI(() => Console("hit", "*** HIT  " + (hit.Resolved ? hit.Module + " line " + hit.Line : hit.Va)));
         private void OnSvcStack(List<DebugStackFrame> frames) => UI(() => OnStack(frames));
+        private void OnSvcLocals(DebugLocals d) => UI(() =>
+        {
+            var sb = new StringBuilder("{\"type\":\"locals\",\"scope\":").Append(Str(d.Scope))
+                .Append(",\"method\":").Append(Str(d.MethodName)).Append(",\"methodItems\":[");
+            AppendVarItems(sb, d.MethodItems);
+            sb.Append("],\"proc\":").Append(Str(d.ProcName)).Append(",\"procItems\":[");
+            AppendVarItems(sb, d.ProcItems);
+            sb.Append("]}");
+            Post(sb.ToString());
+        });
+
+        private static void AppendVarItems(StringBuilder sb, List<DebugLocal> items)
+        {
+            for (int i = 0; items != null && i < items.Count; i++)
+            {
+                var l = items[i];
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"name\":").Append(Str(l.Name))
+                  .Append(",\"type\":").Append(Str(l.Type))
+                  .Append(",\"value\":").Append(Str(l.Value)).Append('}');
+            }
+        }
+        private void OnSvcModuleData(string module, List<DebugLocal> items) => UI(() =>
+        {
+            var sb = new StringBuilder("{\"type\":\"moduledata\",\"module\":").Append(Str(module)).Append(",\"items\":[");
+            AppendVarItems(sb, items);
+            sb.Append("]}");
+            Post(sb.ToString());
+        });
         private void OnSvcWatch(DebugWatch w) => UI(() => OnWatch(w));
         private void OnSvcBreakpointSet(DebugBreakpoint bp) => UI(() => SendBps());
         private void OnSvcBreakpointRemoved(string m, int l) => UI(() => SendBps());
@@ -585,6 +618,8 @@ namespace ClarionDebugger.Terminal
 
                 SendSource(p.ResolvedPath, p.Proc, p.Line);
                 _svc.RequestStack();
+                _svc.RequestLocals();
+                _svc.RequestModuleData();
                 foreach (var name in _watched) _svc.Watch(name);
 
                 if (!string.IsNullOrEmpty(p.ResolvedPath))

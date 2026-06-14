@@ -240,7 +240,7 @@
     <div class="sidebar col" id="colLeft">
       <details class="section" open data-sec="variables">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Variables<span class="hint" id="varsHint">file buffers</span><span class="sec-x" title="Hide section">✕</span></summary>
-        <div class="body" id="varTree"><div class="empty">Start a session to load file buffers.</div></div>
+        <div class="body" id="varTree"><div id="methodTree"></div><div id="localsTree"></div><div id="moduleTree"></div><div id="bufTree"><div class="empty">Start a session to load file buffers.</div></div></div>
       </details>
       <details class="section" open data-sec="watch">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Watch <span class="count" id="watchCount">0</span><span class="hint">type · ☆ tree · right-click</span><span class="sec-x" title="Hide section">✕</span></summary>
@@ -668,8 +668,69 @@
   function cssEsc(s){ return s.replace(/["\\]/g,'\\$&'); }
 
   // ---- Variables tree: split data symbols into Tables (file record buffers) + Global Variables ----
+  // ---- one renderer for a collapsible name/value/type group (Locals, Module Data) ----
+  // GROUP-typed rows carry a `children` array and expand to nested member rows (recursively); the engine
+  // has already read every member's live value, so no per-row round-trip is needed.
+  function renderVarGroup(el, label, extra, items){
+    if(!el) return;
+    el.innerHTML='';
+    if(!items.length) return;
+    let open=true;
+    const hdr=document.createElement('div'); hdr.className='row'; hdr.style.cursor='pointer';
+    hdr.innerHTML='<span class="ar">▾</span><span class="vname">'+esc(label)+'</span>'
+      +(extra?'<span class="vtype">'+esc(extra)+'</span>':'')+'<span class="count">'+items.length+'</span>';
+    el.appendChild(hdr);
+    const tops=items.map(v=>renderVarRow(el, v, 1));
+    hdr.onclick=()=>{ open=!open; hdr.querySelector('.ar').textContent=open?'▾':'▸';
+      tops.forEach(t=>t.setVisible(open)); };
+  }
+
+  // Render one variable row (and, for a GROUP, its nested members). Returns a {setVisible} handle whose
+  // cascade hides/shows this row and all descendants, honouring each group's own expanded/collapsed state.
+  function renderVarRow(container, v, depth){
+    const kidsData = v.children || [];
+    const hasKids = kidsData.length > 0;
+    const row=document.createElement('div'); row.className='row';
+    row.style.paddingLeft=(14+depth*16)+'px';
+    const isNum=/^-?[0-9]/.test(v.value||'');
+    row.innerHTML='<span class="ar">'+(hasKids?'▸':'')+'</span>'
+      +'<span class="vname field">'+esc(v.name)+'</span>'
+      +'<span class="vval'+(isNum?' num':'')+'">'+esc(v.value||'')+'</span>'
+      +'<span class="vtype">'+esc(v.type||'')+'</span>';
+    container.appendChild(row);
+
+    const kids=[]; let kidOpen=false;
+    if(hasKids){
+      kidsData.forEach(c=>kids.push(renderVarRow(container, c, depth+1)));
+      kids.forEach(k=>k.setVisible(false));
+      const toggle=()=>{ kidOpen=!kidOpen; row.querySelector('.ar').textContent=kidOpen?'▾':'▸';
+        kids.forEach(k=>k.setVisible(kidOpen)); };
+      row.style.cursor='pointer'; row.onclick=toggle;
+    }
+    return { setVisible(b){
+      row.style.display=b?'':'none';
+      if(b){ kids.forEach(k=>k.setVisible(kidOpen)); }
+      else { kids.forEach(k=>k.setVisible(false)); kidOpen=false; if(hasKids) row.querySelector('.ar').textContent='▸'; }
+    } };
+  }
+
+  // ---- locals: current frame (method/routine) + host procedure, refreshed each pause ----
+  function buildVars(m){
+    const meth=m.methodItems||[], proc=m.procItems||[];
+    const methLabel = m.scope==='routine' ? 'Routine Data' : 'Method Data';
+    renderVarGroup($('methodTree'), methLabel, m.method, meth);   // empty when paused in the procedure body
+    renderVarGroup($('localsTree'), 'Procedure Data', m.proc, proc);
+    const hint=$('varsHint');
+    if(hint) hint.textContent = (meth.length||proc.length) ? (meth.length+proc.length)+' locals' : 'file buffers';
+  }
+
+  // ---- module-scope data (current module's DATA section, refreshed each pause) ----
+  function buildModuleData(module, items){
+    renderVarGroup($('moduleTree'), 'Module Data', module, items||[]);
+  }
+
   function buildVarTree(symbols){
-    const tree=$('varTree'); tree.innerHTML='';
+    const tree=$('bufTree'); tree.innerHTML='';
     if(!symbols || !symbols.length){ tree.innerHTML='<div class="empty">No static data symbols.</div>'; return; }
     const isTable=s=> (s.fields && s.fields.length) && /\$.*:record$/i.test(s.name);  // FILE$PREFIX:RECORD
     const tables=symbols.filter(isTable);
@@ -678,61 +739,53 @@
     treeGroup(tree,'Global Variables',globals,false);
   }
 
-  // One collapsible category. Records (GROUPs) expand to fields; scalars are leaves. Fields/leaves
-  // are live-watched only while visible (section open, and for fields the record open too).
+  // One collapsible category. GROUPs expand to their fields (nested groups recurse); scalar leaves are
+  // live-watched by name only while visible (section open, and every enclosing group open too).
   function treeGroup(tree,label,syms,openByDefault){
     const hdr=document.createElement('div'); hdr.className='row'; hdr.style.cursor='pointer';
     hdr.innerHTML='<span class="ar">'+(openByDefault?'▾':'▸')+'</span><span class="vname">'+esc(label)+'</span>'
       +'<span class="count">'+syms.length+'</span>';
     tree.appendChild(hdr);
     let open=openByDefault;
-    const members=[];
+    const tops=syms.map(s=>renderSymRow(tree, s, 1));
+    function applyTop(){ tops.forEach(t=>t.setVisible(open)); }
+    hdr.onclick=()=>{ open=!open; hdr.querySelector('.ar').textContent=open?'▾':'▸'; applyTop(); };
+    applyTop();
+  }
 
-    syms.forEach(s=>{
-      const isGroup = s.fields && s.fields.length;
-      const rec=document.createElement('div'); rec.className='row lvl1'; rec.style.display=open?'':'none';
-      rec.innerHTML='<span class="ar">'+(isGroup?'▸':'')+'</span><span class="vname">'+esc(s.name)+'</span>'
-        +'<span class="vtype">'+esc(s.typeName||('size '+s.size))+'</span>';
-      tree.appendChild(rec);
-
-      if(!isGroup){
-        rec.dataset.name=s.name; rec.classList.add('selrow');
-        rec.innerHTML+='<span class="veq">=</span><span class="vval pending">…</span>'; wireSel(rec);
-        members.push({type:'leaf', el:rec, name:s.name});
-      } else {
-        const entry={type:'rec', el:rec, recOpen:false, fields:[]};
-        s.fields.forEach(f=>{
-          const fr=document.createElement('div'); fr.className='row lvl2 selrow'; fr.dataset.name=f.name; fr.style.display='none';
-          fr.innerHTML='<span class="ar"></span><span class="vname field">'+esc(f.name)+'</span>'
-            +'<span class="vtype">'+esc(f.typeName||'')+'</span><span class="veq">=</span><span class="vval pending">…</span>'
-            +'<span class="pin">'+STAR+'</span>';
-          fr.querySelector('.pin').onclick=e=>{ e.stopPropagation(); e.currentTarget.classList.add('pinned'); addWatch(f.name); };
-          wireSel(fr);
-          tree.appendChild(fr); entry.fields.push({el:fr,name:f.name});
-        });
-        rec.onclick=e=>{ if(e.target.closest('.pin')) return; e.stopPropagation();
-          entry.recOpen=!entry.recOpen; rec.querySelector('.ar').textContent=entry.recOpen?'▾':'▸'; apply(); };
-        members.push(entry);
-      }
-    });
-
-    function apply(){
-      members.forEach(m=>{
-        if(m.type==='leaf'){
-          m.el.style.display = open?'':'none';
-          if(!watched.has(m.name)) send(open?'watch':'unwatch', m.name);
-        } else {
-          m.el.style.display = open?'':'none';
-          m.fields.forEach(f=>{
-            const show = open && m.recOpen;
-            f.el.style.display = show?'':'none';
-            if(!watched.has(f.name)) send(show?'watch':'unwatch', f.name);
-          });
-        }
-      });
+  // Render a data symbol / field row recursively. GROUPs expand; scalar leaves carry data-name (watched
+  // by name → value arrives via applyValue) plus pin-to-watch. Returns a {setVisible} cascade handle.
+  function renderSymRow(tree, s, depth){
+    const fieldsData = s.fields || [];
+    const isGroup = fieldsData.length > 0;
+    const name = s.name;
+    const row=document.createElement('div'); row.className='row'+(isGroup?'':' selrow');
+    row.style.paddingLeft=(14+depth*16)+'px';
+    row.innerHTML='<span class="ar">'+(isGroup?'▸':'')+'</span>'
+      +'<span class="vname'+(depth>1?' field':'')+'">'+esc(name)+'</span>'
+      +'<span class="vtype">'+esc(s.typeName||(s.size!=null?'size '+s.size:''))+'</span>';
+    if(!isGroup){
+      row.dataset.name=name;
+      row.innerHTML+='<span class="veq">=</span><span class="vval pending">…</span><span class="pin">'+STAR+'</span>';
+      row.querySelector('.pin').onclick=e=>{ e.stopPropagation(); e.currentTarget.classList.add('pinned'); addWatch(name); };
+      wireSel(row);
     }
-    hdr.onclick=()=>{ open=!open; hdr.querySelector('.ar').textContent=open?'▾':'▸'; apply(); };
-    apply();
+    tree.appendChild(row);
+
+    const kids=[]; let kidOpen=false;
+    if(isGroup){
+      fieldsData.forEach(f=>kids.push(renderSymRow(tree, f, depth+1)));
+      kids.forEach(k=>k.setVisible(false));
+      row.style.cursor='pointer';
+      row.onclick=e=>{ if(e.target.closest('.pin')) return; e.stopPropagation();
+        kidOpen=!kidOpen; row.querySelector('.ar').textContent=kidOpen?'▾':'▸'; kids.forEach(k=>k.setVisible(kidOpen)); };
+    }
+    return { setVisible(b){
+      row.style.display=b?'':'none';
+      if(!isGroup){ if(!watched.has(name)) send(b?'watch':'unwatch', name); return; }
+      if(b){ kids.forEach(k=>k.setVisible(kidOpen)); }
+      else { kids.forEach(k=>k.setVisible(false)); kidOpen=false; row.querySelector('.ar').textContent='▸'; }
+    } };
   }
 
   // ---- call stack ----
@@ -901,6 +954,8 @@
       case 'resumed': break;
       case 'globals': buildVarTree(m.symbols); allSyms=collectSyms(m.symbols); break;
       case 'stack': buildStack(m.frames||[]); break;
+      case 'locals': buildVars(m); break;
+      case 'moduledata': buildModuleData(m.module, m.items||[]); break;
       case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded); break;
       case 'bplist': buildBps(m.bps||[]); break;
       case 'procedures': buildProcs(m.procs||[]); break;

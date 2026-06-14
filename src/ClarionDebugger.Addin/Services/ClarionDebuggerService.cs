@@ -84,6 +84,27 @@ namespace ClarionDebugger.Services
         public string ResolvedPath; // generated .clw path via the active .red (or null)
     }
 
+    /// <summary>One local variable of the current procedure (EXPERIMENT: Locals/Variables panel),
+    /// value already rendered for display by the engine.</summary>
+    public sealed class DebugLocal
+    {
+        public string Name;       // e.g. LOC:COUNTER
+        public string Type;       // Clarion type label, e.g. LONG, STRING(20), DECIMAL(7,2)
+        public string Value;      // rendered value
+        public int FrameOff;      // frame-pointer-relative offset (diagnostic)
+    }
+
+    /// <summary>The Locals payload for a pause: the current frame's locals (method/routine) plus, when in a
+    /// method/routine, the host procedure's locals (Clarion procedure data is in scope inside its methods).</summary>
+    public sealed class DebugLocals
+    {
+        public string Scope;       // current frame kind: method | routine | procedure
+        public string MethodName;  // current method/routine name (null when paused in the procedure body)
+        public List<DebugLocal> MethodItems = new List<DebugLocal>();
+        public string ProcName;    // host (or current) procedure name
+        public List<DebugLocal> ProcItems = new List<DebugLocal>();
+    }
+
     /// <summary>A watch-by-name result (Phase 3 'watch' command), value already rendered for display.</summary>
     public sealed class DebugWatch
     {
@@ -129,6 +150,8 @@ namespace ClarionDebugger.Services
         public event Action<List<DebugBreakpoint>> BreakpointListReceived;
         public event Action<uint, int, byte[]> MemoryReceived;     // addr, requested len, bytes
         public event Action<List<DebugStackFrame>> StackReceived;  // resolved call stack
+        public event Action<DebugLocals> LocalsReceived; // EXPERIMENT: current frame + host-procedure locals
+        public event Action<string, List<DebugLocal>> ModuleDataReceived; // EXPERIMENT: current module's module-scope data (module, items)
         public event Action<DebugWatch> WatchReceived;             // watch-by-name value
         public event Action<DebugModule> ModuleLoaded;             // image mapped (EXE or DLL)
         public event Action<DebugModule> ModuleUnloaded;           // image unmapped
@@ -332,6 +355,12 @@ namespace ClarionDebugger.Services
 
         /// <summary>Request the resolved call stack (paused only); result arrives via StackReceived.</summary>
         public bool RequestStack() { return SendCommand("stack"); }
+
+        /// <summary>EXPERIMENT: request the current procedure's locals (paused only); result arrives via LocalsReceived.</summary>
+        public bool RequestLocals() { return SendCommand("locals"); }
+
+        /// <summary>EXPERIMENT: request the current module's module-scope data (paused only); via ModuleDataReceived.</summary>
+        public bool RequestModuleData() { return SendCommand("moduledata"); }
 
         /// <summary>A valid Clarion data-symbol name for watch-by-name (blocks command/arg injection).
         /// Allows letters, digits, and the Clarion separators _ : $ . (e.g. JOB:JOB_DESC,
@@ -552,6 +581,21 @@ namespace ClarionDebugger.Services
                     StackReceived?.Invoke(frames);
                     break;
 
+                case "locals":
+                    LocalsReceived?.Invoke(new DebugLocals
+                    {
+                        Scope = GetStr(json, "scope"),
+                        MethodName = GetStr(json, "method"),
+                        MethodItems = ParseLocals(ExtractArray(json, "methodItems")),
+                        ProcName = GetStr(json, "proc"),
+                        ProcItems = ParseLocals(ExtractArray(json, "procItems")),
+                    });
+                    break;
+
+                case "moduledata":
+                    ModuleDataReceived?.Invoke(GetStr(json, "module"), ParseLocals(json));
+                    break;
+
                 case "watch":
                     var w = ParseWatch(json);
                     if (w != null) WatchReceived?.Invoke(w);
@@ -742,6 +786,40 @@ namespace ClarionDebugger.Services
             return list;
         }
 
+        /// <summary>Slice out one named JSON array's body, e.g. ExtractArray(json,"methodItems") -> the text
+        /// between its [ and the matching ] — so the two locals arrays in a `locals` event parse separately.
+        /// Item objects carry only escaped-string values (no raw brackets), so the first ']' is the end.</summary>
+        private static string ExtractArray(string json, string key)
+        {
+            int i = json.IndexOf("\"" + key + "\":[", StringComparison.Ordinal);
+            if (i < 0) return "";
+            i += key.Length + 4;
+            int j = json.IndexOf(']', i);
+            return j < 0 ? "" : json.Substring(i, j - i);
+        }
+
+        private static List<DebugLocal> ParseLocals(string json)
+        {
+            var list = new List<DebugLocal>();
+            try
+            {
+                foreach (Match m in Regex.Matches(json, "\\{[^{}]*\\}"))
+                {
+                    string o = m.Value;
+                    if (!o.Contains("\"name\":") || !o.Contains("\"value\":")) continue;
+                    list.Add(new DebugLocal
+                    {
+                        Name = GetStr(o, "name"),
+                        Type = GetStr(o, "type"),
+                        Value = GetStr(o, "value"),
+                        FrameOff = GetInt(o, "frameOff"),
+                    });
+                }
+            }
+            catch { }
+            return list;
+        }
+
         private static DebugWatch ParseWatch(string json)
         {
             try
@@ -751,47 +829,12 @@ namespace ClarionDebugger.Services
                 w.Threaded = GetBool(json, "threaded");
                 w.TypeName = GetStr(json, "typeName");
                 w.Va = GetStr(json, "va");
-                int size = GetInt(json, "size");
-                byte[] bytes = ParseHexBytes(GetStr(json, "bytes"));
-                w.Value = RenderValue(w.TypeName, bytes, size);
+                // Value is now formatted engine-side by the shared Clarion value renderer (same one the
+                // Locals panel uses) and shipped ready-to-display — no separate client-side formatting.
+                w.Value = GetStr(json, "value");
                 return w;
             }
             catch { return null; }
-        }
-
-        /// <summary>Render raw target memory as a Clarion-typed display string for the watch pane.</summary>
-        public static string RenderValue(string typeName, byte[] b, int size)
-        {
-            if (b == null || b.Length == 0) return "(no data)";
-            try
-            {
-                switch (typeName)
-                {
-                    case "BYTE": return b[0].ToString();
-                    case "SHORT": return b.Length >= 2 ? BitConverter.ToInt16(b, 0).ToString() : b[0].ToString();
-                    case "LONG": return b.Length >= 4 ? BitConverter.ToInt32(b, 0).ToString() : "?";
-                    case "STRING":
-                    case "CSTRING":
-                    {
-                        int n = b.Length;
-                        if (typeName == "CSTRING") { int z = Array.IndexOf(b, (byte)0); if (z >= 0) n = z; }
-                        string s = System.Text.Encoding.GetEncoding(1252).GetString(b, 0, n).TrimEnd(' ', '\0');
-                        return "'" + s + "'";
-                    }
-                    case "GROUP":
-                        return "(group, " + size + " bytes)";
-                    default:
-                        return ToHexInline(b);
-                }
-            }
-            catch { return ToHexInline(b); }
-        }
-
-        private static string ToHexInline(byte[] b)
-        {
-            var sb = new System.Text.StringBuilder();
-            for (int i = 0; i < b.Length && i < 32; i++) { if (i > 0) sb.Append(' '); sb.Append(b[i].ToString("X2")); }
-            return sb.ToString();
         }
 
         /// <summary>Synchronously query the EXE's static data symbols (globals + file record buffers

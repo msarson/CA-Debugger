@@ -24,7 +24,7 @@ namespace ClarionDbg.Cli
             TswdDebugInfo.DataLocation loc; LoadedModule owner;
             if (!ResolveDataAcrossModules(name, out owner, out loc))
             {
-                if (EmitJson) Console.WriteLine("@JSON " + Json.Watch(name, false, 0, 0, false, 0, null, 0, null, 0));
+                if (EmitJson) Console.WriteLine("@JSON " + Json.Watch(name, false, 0, 0, false, 0, null, 0, null, null, 0));
                 Console.WriteLine($"  watch {name}: not found");
                 return false;
             }
@@ -115,9 +115,11 @@ namespace ClarionDbg.Cli
             int read;
             Native.ReadProcessMemory(_hProcess, (IntPtr)instanceVa, buf, len, out read);
             if (read < 0) read = 0;
-            string tn = TswdDebugInfo.TypeCodeName(typeCode);
+            // unified rendering: same engine-side type label + value formatter the Locals panel uses
+            string tn = ClarionTypeLabel(typeCode, 0, size, 0);
+            string value = FormatValueAt(typeCode, 0, size, 0, instanceVa);
             if (EmitJson)
-                Console.WriteLine("@JSON " + Json.Watch(name, true, templateVa, instanceVa, threaded, typeCode, tn, size, buf, read));
+                Console.WriteLine("@JSON " + Json.Watch(name, true, templateVa, instanceVa, threaded, typeCode, tn, size, value, buf, read));
             Console.WriteLine($"  watch {name}: {(tn ?? $"type 0x{typeCode:X2}")} size {size} at 0x{instanceVa:X}{(threaded ? $" (threaded; template 0x{templateVa:X})" : "")}");
             for (int row = 0; row < read; row += 16)
             {

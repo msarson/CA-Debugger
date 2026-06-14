@@ -425,6 +425,8 @@ namespace ClarionDbg.Cli
                 if (cmd.Length == 0) continue;
                 var parts = cmd.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
                 string verb = parts[0].ToLowerInvariant();
+                try
+                {
                 switch (verb)
                 {
                     case "continue": case "c": case "g":
@@ -469,6 +471,14 @@ namespace ClarionDbg.Cli
                         HandleStackCommand(parts, ref ctx, haveCtx);
                         break;
 
+                    case "locals": case "vars":
+                        HandleLocalsCommand(parts, ref ctx, haveCtx);
+                        break;
+
+                    case "moduledata": case "moddata":
+                        HandleModuleDataCommand(parts, ref ctx, haveCtx);
+                        break;
+
                     case "sym":
                         HandleSymCommand(parts);
                         break;
@@ -489,6 +499,13 @@ namespace ClarionDbg.Cli
                     default:
                         EmitError("unknown command: " + verb);
                         break;
+                }
+                }
+                catch (Exception ex)
+                {
+                    // A command-handler bug must never crash the engine — that would terminate the
+                    // debuggee. Report it and keep the pause loop alive.
+                    EmitError("command '" + verb + "' failed: " + ex.Message);
                 }
             }
         }
@@ -533,6 +550,8 @@ namespace ClarionDbg.Cli
                     case "stepover": case "next": case "n":
                     case "stepout": case "out": case "finish": case "o":
                     case "mem": case "regs": case "stack": case "bt": case "where": case "watch":
+                    case "locals": case "vars":
+                    case "moduledata": case "moddata":
                         EmitError("target is running — " + verb + " is only valid while paused");
                         break;
                     default:
