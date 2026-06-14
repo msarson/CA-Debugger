@@ -111,6 +111,23 @@ namespace ClarionDbg.Core
     }
 
     /// <summary>
+    /// A local variable or parameter of a procedure (a tag-04 record in the +0x2C tree whose 2nd
+    /// field is a NEGATIVE frame-pointer-relative offset, scoped to the most recent preceding proc
+    /// record). The live value lives at [frame-pointer + FrameOff] on the paused thread.
+    /// Ported from clarion-pdb read_locals (DiscoverClarion); coverage is partial — by-ref params
+    /// (positive offsets above the frame ptr) are not yet captured.
+    /// </summary>
+    public sealed class LocalSym
+    {
+        public string Name;       // pool name, e.g. LOC:COUNTER
+        public int FrameOff;      // frame-pointer-relative byte offset (negative = below the frame ptr)
+        public byte TypeCode;     // Clarion type code (0x11 LONG, 0x18 STRING, 0x16 ref, 0x23 DECIMAL, ...)
+        public byte Target;       // for a reference (0x16): the referent's type code (0x18 STRING, 0x08 group)
+        public uint Size;         // char count (STRING) / byte width (scalar, DECIMAL); 0 = unknown
+        public int Places;        // DECIMAL/PDECIMAL scale (digits after the point)
+    }
+
+    /// <summary>
     /// Parser for the Clarion "TSWD" embedded debug blob (TopSpeed Watcom Debug).
     /// Decodes the TOC header, module-name table, and both line-number tables.
     /// Layout reference: docs/TSWD-format.md.
@@ -617,6 +634,62 @@ namespace ClarionDbg.Core
                 if (ds.Fields[i].Size == 0 || ds.Fields[i].Size > span) ds.Fields[i].Size = span;
             }
             return ds;
+        }
+
+        // local variables / parameters per procedure (entry RVA -> locals), from the +0x2C tree.
+        private Dictionary<uint, List<LocalSym>> _locals;
+
+        /// <summary>Local variables + parameters for each procedure, keyed by proc ENTRY RVA. A local is a
+        /// tag-04/05 record whose 2nd field is a NEGATIVE frame offset (vs a proc's .text entry RVA or a
+        /// global's data RVA), scoped lexically to the most recent preceding proc record. Lazily built and
+        /// cached. Ported from clarion-pdb read_locals (the proven PDB-generation spec); see <see cref="LocalSym"/>.</summary>
+        public Dictionary<uint, List<LocalSym>> ReadLocals()
+        {
+            if (_locals != null) return _locals;
+            var outMap = new Dictionary<uint, List<LocalSym>>();
+            int poolLen = OffSymbolNameArray - OffSymbolPool;
+            int end = OffTable34;
+            if (_base + end > _b.Length) end = _b.Length - _base;   // clamp to the blob so reads stay in range
+            uint cur = 0; bool haveCur = false;                     // current proc entry RVA (lexical scope)
+            for (int p = OffTable2C; p >= 0 && p + 19 <= end; p++)
+            {
+                byte tag = _b[_base + p];
+                if (tag != 0x04 && tag != 0x05) continue;
+                uint nameRef = U32(p + 5);
+                if (nameRef < 1 || nameRef >= (uint)poolLen) continue;
+                string nm = SymbolNameAt((int)nameRef, poolLen);
+                if (nm == null) continue;
+
+                uint f3 = U32(p + 9);
+                if (f3 >= _textLo && f3 < _textHi)                  // proc: 2nd field is an entry RVA in .text
+                {
+                    cur = f3; haveCur = true;
+                    if (!outMap.ContainsKey(cur)) outMap[cur] = new List<LocalSym>();
+                }
+                else if ((f3 & 0x80000000) != 0 && haveCur)         // negative 2nd field -> a local of `cur`
+                {
+                    int frameOff = BitConverter.ToInt32(_b, _base + p + 9);
+                    byte code = _b[_base + p + 18];                 // typecode (after the storage byte @+17)
+                    byte target = 0; uint size = 0; int places = 0;
+                    if (code == 0x16)                              // reference
+                    {
+                        if (p + 23 < end) target = _b[_base + p + 23];
+                        if (target == 0x18 && p + 50 <= end) size = U32(p + 46);   // &STRING char count
+                    }
+                    else if (code == 0x18 && p + 45 <= end) size = U32(p + 41);    // inline STRING/CSTRING/PSTRING
+                    else if ((code == 0x11 || code == 0x12 || code == 0x13 || code == 0x25) && p + 23 <= end)
+                        size = U32(p + 19);                                        // scalar byte width
+                    else if ((code == 0x23 || code == 0x24) && p + 24 <= end)      // DECIMAL / PDECIMAL
+                    {
+                        size = U32(p + 19);
+                        places = _b[_base + p + 23];
+                    }
+                    outMap[cur].Add(new LocalSym { Name = nm, FrameOff = frameOff, TypeCode = code,
+                                                   Target = target, Size = size, Places = places });
+                }
+            }
+            _locals = outMap;
+            return _locals;
         }
 
         // name -> resolved location for watch-by-name (statics + record fields, case-insensitive)

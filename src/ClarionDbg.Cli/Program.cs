@@ -22,6 +22,7 @@ namespace ClarionDbg.Cli
                     case "lines": return Lines(args);
                     case "symbols": return Symbols(args);
                     case "globals": return Globals(args);
+                    case "locals": return Locals(args);
                     case "break": return Break(args);
                     default: Usage(); return 1;
                 }
@@ -303,6 +304,34 @@ namespace ClarionDbg.Cli
                 if (i < xs.Count) { start = xs[i]; prev = xs[i]; }
             }
             return sb.ToString();
+        }
+
+        /// <summary>SPIKE: dump per-procedure local variables decoded from the +0x2C tree (frame offsets +
+        /// type codes). Static — no run needed. `ClarionDbg locals &lt;exe&gt; [--proc NAME]`.</summary>
+        private static int Locals(string[] args)
+        {
+            if (args.Length < 2) { Usage(); return 1; }
+            var (pe, dbg) = LoadDebug(args[1]);
+            var locals = dbg.ReadLocals();
+            var syms = dbg.Symbols ?? new List<ProcSymbol>();
+            var nameByRva = new Dictionary<uint, string>();
+            foreach (var s in syms) if (!nameByRva.ContainsKey(s.EntryRva)) nameByRva[s.EntryRva] = s.Name;
+
+            string proc = GetOpt(args, "--proc");
+            int total = locals.Sum(kv => kv.Value.Count);
+            Console.WriteLine($"{locals.Count} procedure(s) carry locals ({total} locals total):");
+            Console.WriteLine();
+            foreach (var kv in locals.OrderBy(k => k.Key))
+            {
+                string pname = nameByRva.TryGetValue(kv.Key, out var n) ? n : $"0x{kv.Key:X}";
+                if (proc != null && pname.IndexOf(proc, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                Console.WriteLine($"  {pname}  (entry 0x{kv.Key:X}) — {kv.Value.Count} local(s):");
+                foreach (var l in kv.Value.OrderByDescending(x => x.FrameOff))
+                    Console.WriteLine($"      [ebp{(l.FrameOff >= 0 ? "+" : "")}{l.FrameOff}]  {l.Name,-24} "
+                        + $"code=0x{l.TypeCode:X2}{(l.Target != 0 ? $" ->0x{l.Target:X2}" : "")} size={l.Size}"
+                        + (l.Places != 0 ? $" places={l.Places}" : ""));
+            }
+            return locals.Count > 0 ? 0 : 3;
         }
 
         private static int Symbols(string[] args)
