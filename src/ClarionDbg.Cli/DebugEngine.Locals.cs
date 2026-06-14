@@ -71,33 +71,47 @@ namespace ClarionDbg.Cli
         private string LocalRowJson(LocalSym l, uint frameEbp)
         {
             uint slotVa = (uint)((long)frameEbp + l.FrameOff);
-            if (l.Type != null && l.Type.Kind == TypeKind.Group)
+            // A GROUP/QUEUE is either a direct instance (code 0x08) or a reference (code 0x16 whose resolved
+            // type's referent is a group — e.g. a browse QUEUE:BROWSE:n). Expand both; refs deref the pointer.
+            ClarionType g = GroupTypeOf(l.Type);
+            if (g != null)
             {
                 uint baseVa = slotVa;
-                if (l.TypeCode == 0x16)   // by-ref group: the stack slot holds a pointer to the instance
+                string label = ClarionTypeLabel(l.TypeCode, l.Target, l.Size, l.Places);   // "GROUP" / "&GROUP" / "&CLASS"
+                if (l.TypeCode == 0x16)   // by-ref: the stack slot holds a pointer to the instance
                 {
                     uint ptr = ReadU32(slotVa);
                     if (ptr == 0)
-                        return "{\"name\":" + Json.Str(l.Name) + ",\"type\":" + Json.Str("&GROUP")
+                        return "{\"name\":" + Json.Str(l.Name) + ",\"type\":" + Json.Str(label)
                              + ",\"value\":" + Json.Str("(null)") + ",\"frameOff\":" + l.FrameOff + "}";
                     baseVa = ptr;
                 }
-                return TypedValueJson(l.Name, l.Type, l.TypeCode, l.Target, l.Size, l.Places, baseVa, l.FrameOff);
+                return TypedValueJson(l.Name, g, l.TypeCode, l.Target, l.Size, l.Places, baseVa, l.FrameOff, label);
             }
             return TypedValueJson(l.Name, null, l.TypeCode, l.Target, l.Size, l.Places, slotVa, l.FrameOff);
+        }
+
+        /// <summary>The GROUP/QUEUE layout a type describes — directly (a group) or through one reference hop
+        /// (a by-ref group/queue/class). Returns null for non-aggregates.</summary>
+        private static ClarionType GroupTypeOf(ClarionType t)
+        {
+            if (t == null) return null;
+            if (t.Kind == TypeKind.Group) return t;
+            if (t.Kind == TypeKind.Reference && t.Referent != null && t.Referent.Kind == TypeKind.Group) return t.Referent;
+            return null;
         }
 
         /// <summary>The single composite value renderer: emit a typed value as a JSON row, recursing GROUP
         /// members into a nested "children" array (each read live at va + memberOffset). Leaves go through the
         /// same <see cref="FormatValueAt"/>/<see cref="ClarionTypeLabel"/> as top-level scalars, so a member
         /// renders identically to a standalone variable of that type. Shared by locals and module data.</summary>
-        private string TypedValueJson(string name, ClarionType type, byte code, byte target, uint size, int places, uint va, int? frameOff)
+        private string TypedValueJson(string name, ClarionType type, byte code, byte target, uint size, int places, uint va, int? frameOff, string groupLabel = null)
         {
             var sb = new StringBuilder();
             sb.Append("{\"name\":").Append(Json.Str(name));
             if (type != null && type.Kind == TypeKind.Group && type.Members != null)
             {
-                sb.Append(",\"type\":").Append(Json.Str("GROUP"));
+                sb.Append(",\"type\":").Append(Json.Str(groupLabel ?? "GROUP"));
                 sb.Append(",\"value\":").Append(Json.Str("{…}"));
                 sb.Append(",\"children\":[");
                 bool first = true;
@@ -133,7 +147,13 @@ namespace ClarionDbg.Cli
         {
             code = 0; target = 0; size = 0; places = 0;
             if (t == null) return;
-            if (t.Tag == 0x16 || t.Tag == 0x26 || t.Tag == 0x29) { code = 0x16; size = 4; return; }
+            if (t.Kind == TypeKind.Reference || t.Tag == 0x16 || t.Tag == 0x26 || t.Tag == 0x29)
+            {
+                // Render a ref MEMBER as a pointer leaf (no blind deref); label it &GROUP when we know the referent.
+                code = 0x16; size = 4;
+                target = (t.Referent != null && t.Referent.Kind == TypeKind.Group) ? (byte)0x08 : (byte)0;
+                return;
+            }
             t.RenderHint(out code, out size, out places);
         }
 
