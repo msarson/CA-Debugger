@@ -691,7 +691,7 @@ namespace ClarionDebugger.Services
                     break;
 
                 case "moduledata":
-                    ModuleDataReceived?.Invoke(GetStr(json, "module"), ParseLocals(json));
+                    ModuleDataReceived?.Invoke(GetStr(json, "module"), ParseLocals(ExtractArray(json, "items")));
                     break;
 
                 case "watch":
@@ -887,25 +887,65 @@ namespace ClarionDebugger.Services
         }
 
         /// <summary>Slice out one named JSON array's body, e.g. ExtractArray(json,"methodItems") -> the text
-        /// between its [ and the matching ] — so the two locals arrays in a `locals` event parse separately.
-        /// Item objects carry only escaped-string values (no raw brackets), so the first ']' is the end.</summary>
+        /// between its '[' and the matching ']'. Scans with string- and depth-awareness so a debuggee-controlled
+        /// value containing ']' '[' '{' '}' (a GROUP/CLASS local renders as "{…}", a STRING may hold a bracket)
+        /// can't terminate the array early. The engine's Json.Str does NOT escape brackets/braces, so a naive
+        /// first-']' scan silently drops every row after the first such value.</summary>
         private static string ExtractArray(string json, string key)
         {
-            int i = json.IndexOf("\"" + key + "\":[", StringComparison.Ordinal);
-            if (i < 0) return "";
-            i += key.Length + 4;
-            int j = json.IndexOf(']', i);
-            return j < 0 ? "" : json.Substring(i, j - i);
+            int k = json.IndexOf("\"" + key + "\"", StringComparison.Ordinal);
+            if (k < 0) return "";
+            int open = json.IndexOf('[', k);
+            if (open < 0) return "";
+            int depth = 0; bool inStr = false, esc = false;
+            for (int p = open; p < json.Length; p++)
+            {
+                char c = json[p];
+                if (inStr)
+                {
+                    if (esc) esc = false;
+                    else if (c == '\\') esc = true;
+                    else if (c == '"') inStr = false;
+                    continue;
+                }
+                if (c == '"') inStr = true;
+                else if (c == '[' || c == '{') depth++;
+                else if (c == ']' || c == '}') { if (--depth == 0) return json.Substring(open + 1, p - open - 1); }
+            }
+            return "";
         }
 
-        private static List<DebugLocal> ParseLocals(string json)
+        /// <summary>Yield each top-level '{…}' object in a JSON array body, tracking string state and brace
+        /// depth so a value containing '{' '}' '[' ']' cannot split a row in the wrong place. Replaces the old
+        /// "\{[^{}]*\}" regex, which matched the innermost braces and therefore dropped any row whose value the
+        /// engine rendered with braces (GROUP/CLASS aggregates) — exactly the case this panel shows today.</summary>
+        private static IEnumerable<string> SplitObjects(string arrayBody)
+        {
+            if (string.IsNullOrEmpty(arrayBody)) yield break;
+            int depth = 0, start = -1; bool inStr = false, esc = false;
+            for (int p = 0; p < arrayBody.Length; p++)
+            {
+                char c = arrayBody[p];
+                if (inStr)
+                {
+                    if (esc) esc = false;
+                    else if (c == '\\') esc = true;
+                    else if (c == '"') inStr = false;
+                    continue;
+                }
+                if (c == '"') inStr = true;
+                else if (c == '{') { if (depth++ == 0) start = p; }
+                else if (c == '}') { if (--depth == 0 && start >= 0) { yield return arrayBody.Substring(start, p - start + 1); start = -1; } }
+            }
+        }
+
+        private static List<DebugLocal> ParseLocals(string arrayBody)
         {
             var list = new List<DebugLocal>();
             try
             {
-                foreach (Match m in Regex.Matches(json, "\\{[^{}]*\\}"))
+                foreach (string o in SplitObjects(arrayBody))
                 {
-                    string o = m.Value;
                     if (!o.Contains("\"name\":") || !o.Contains("\"value\":")) continue;
                     list.Add(new DebugLocal
                     {
