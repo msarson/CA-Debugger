@@ -54,21 +54,87 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Build the JSON rows for one frame's locals — its proc's entry RVA keys the local set,
-        /// each value read live at [frameEbp + frameOffset]. Shared by the method and host-procedure groups.</summary>
+        /// each value read live at [frameEbp + frameOffset]. GROUP locals expand to nested member rows.
+        /// Shared by the method and host-procedure groups.</summary>
         private List<string> LocalRowsFor(LoadedModule m, uint entryRva, uint frameEbp)
         {
             var rows = new List<string>();
             List<LocalSym> locals;
             if (m != null && m.Dbg != null && m.Dbg.ReadLocals().TryGetValue(entryRva, out locals))
                 foreach (var l in locals)
-                {
-                    uint va = (uint)((long)frameEbp + l.FrameOff);
-                    string type = ClarionTypeLabel(l.TypeCode, l.Target, l.Size, l.Places);
-                    string val = FormatValueAt(l.TypeCode, l.Target, l.Size, l.Places, va);
-                    rows.Add("{\"name\":" + Json.Str(l.Name) + ",\"type\":" + Json.Str(type)
-                        + ",\"value\":" + Json.Str(val) + ",\"frameOff\":" + l.FrameOff + "}");
-                }
+                    rows.Add(LocalRowJson(l, frameEbp));
             return rows;
+        }
+
+        /// <summary>One local's JSON row. A GROUP local (direct instance or by-ref) expands to nested member
+        /// rows read at the instance base + each member's byte offset; scalars/strings/refs render flat.</summary>
+        private string LocalRowJson(LocalSym l, uint frameEbp)
+        {
+            uint slotVa = (uint)((long)frameEbp + l.FrameOff);
+            if (l.Type != null && l.Type.Kind == TypeKind.Group)
+            {
+                uint baseVa = slotVa;
+                if (l.TypeCode == 0x16)   // by-ref group: the stack slot holds a pointer to the instance
+                {
+                    uint ptr = ReadU32(slotVa);
+                    if (ptr == 0)
+                        return "{\"name\":" + Json.Str(l.Name) + ",\"type\":" + Json.Str("&GROUP")
+                             + ",\"value\":" + Json.Str("(null)") + ",\"frameOff\":" + l.FrameOff + "}";
+                    baseVa = ptr;
+                }
+                return TypedValueJson(l.Name, l.Type, l.TypeCode, l.Target, l.Size, l.Places, baseVa, l.FrameOff);
+            }
+            return TypedValueJson(l.Name, null, l.TypeCode, l.Target, l.Size, l.Places, slotVa, l.FrameOff);
+        }
+
+        /// <summary>The single composite value renderer: emit a typed value as a JSON row, recursing GROUP
+        /// members into a nested "children" array (each read live at va + memberOffset). Leaves go through the
+        /// same <see cref="FormatValueAt"/>/<see cref="ClarionTypeLabel"/> as top-level scalars, so a member
+        /// renders identically to a standalone variable of that type. Shared by locals and module data.</summary>
+        private string TypedValueJson(string name, ClarionType type, byte code, byte target, uint size, int places, uint va, int? frameOff)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"name\":").Append(Json.Str(name));
+            if (type != null && type.Kind == TypeKind.Group && type.Members != null)
+            {
+                sb.Append(",\"type\":").Append(Json.Str("GROUP"));
+                sb.Append(",\"value\":").Append(Json.Str("{…}"));
+                sb.Append(",\"children\":[");
+                bool first = true;
+                foreach (var mb in type.Members)
+                {
+                    byte mc, mt; uint msz; int mpl;
+                    CodeForType(mb.Type, out mc, out mt, out msz, out mpl);
+                    uint mva = (uint)((long)va + mb.Offset);
+                    if (!first) sb.Append(',');
+                    first = false;
+                    sb.Append(TypedValueJson(mb.Name ?? "?", mb.Type, mc, mt, msz, mpl, mva, null));
+                }
+                sb.Append(']');
+            }
+            else if (type != null && type.Kind == TypeKind.Array)
+            {
+                sb.Append(",\"type\":").Append(Json.Str("ARRAY(" + type.Length + ")"));
+                sb.Append(",\"value\":").Append(Json.Str("[…]"));   // element expansion is a follow-up
+            }
+            else
+            {
+                sb.Append(",\"type\":").Append(Json.Str(ClarionTypeLabel(code, target, size, places)));
+                sb.Append(",\"value\":").Append(Json.Str(FormatValueAt(code, target, size, places, va)));
+            }
+            if (frameOff.HasValue) sb.Append(",\"frameOff\":").Append(frameOff.Value);
+            sb.Append('}');
+            return sb.ToString();
+        }
+
+        /// <summary>Map a resolved member type to the flat (code,target,size,places) the value renderer takes.
+        /// Reference/class-ref tags (0x16/0x26/0x29) render as a pointer; the rest defer to RenderHint.</summary>
+        private static void CodeForType(ClarionType t, out byte code, out byte target, out uint size, out int places)
+        {
+            code = 0; target = 0; size = 0; places = 0;
+            if (t == null) return;
+            if (t.Tag == 0x16 || t.Tag == 0x26 || t.Tag == 0x29) { code = 0x16; size = 4; return; }
+            t.RenderHint(out code, out size, out places);
         }
 
         /// <summary>Walk the EBP frame chain from <paramref name="startEbp"/> to the nearest Procedure-kind
@@ -116,11 +182,8 @@ namespace ClarionDbg.Cli
                         if (ds.Name != null && ds.Name.EndsWith(":RECORD", StringComparison.OrdinalIgnoreCase))
                             continue;   // file record buffer — belongs to the file-buffer tree, not module data
                         uint va = m.LoadBase + ds.Rva;
-                        string type = ClarionTypeLabel(ds.TypeCode, 0, ds.Size, 0);
-                        string val = FormatValueAt(ds.TypeCode, 0, ds.Size, 0, va);
-                        rows.Add("{\"name\":" + Json.Str(ds.Name)
-                            + ",\"type\":" + Json.Str(type)
-                            + ",\"value\":" + Json.Str(val) + "}");
+                        ClarionType gt = ds.Type != null && ds.Type.Kind == TypeKind.Group ? ds.Type : null;
+                        rows.Add(TypedValueJson(ds.Name, gt, ds.TypeCode, 0, ds.Size, 0, va, null));
                     }
                 }
             }

@@ -327,11 +327,35 @@ namespace ClarionDbg.Cli
                 if (proc != null && pname.IndexOf(proc, StringComparison.OrdinalIgnoreCase) < 0) continue;
                 Console.WriteLine($"  {pname}  (entry 0x{kv.Key:X}) — {kv.Value.Count} local(s):");
                 foreach (var l in kv.Value.OrderByDescending(x => x.FrameOff))
+                {
                     Console.WriteLine($"      [ebp{(l.FrameOff >= 0 ? "+" : "")}{l.FrameOff}]  {l.Name,-24} "
                         + $"code=0x{l.TypeCode:X2}{(l.Target != 0 ? $" ->0x{l.Target:X2}" : "")} size={l.Size}"
-                        + (l.Places != 0 ? $" places={l.Places}" : ""));
+                        + (l.Places != 0 ? $" places={l.Places}" : "")
+                        + (l.Type != null && l.Type.Kind == TypeKind.Group ? $"  GROUP(size={l.Type.Size}) typeRef=0x{l.TypeRef:X}" : ""));
+                    if (l.Type != null && l.Type.Kind == TypeKind.Group)
+                        DumpTypeMembers(l.Type, 10);
+                }
             }
             return locals.Count > 0 ? 0 : 3;
+        }
+
+        /// <summary>Pretty-print a resolved type tree (GROUP members with byte offsets, recursing nested
+        /// groups) for the locals/globals dumps — proves the typeRef aggregate decode byte-for-byte.</summary>
+        private static void DumpTypeMembers(ClarionType g, int indent)
+        {
+            if (g == null || g.Members == null) return;
+            string pad = new string(' ', indent);
+            foreach (var mb in g.Members)
+            {
+                var mt = mb.Type;
+                string kind = mt != null ? mt.Kind.ToString().ToLowerInvariant() : "?";
+                uint sz = mt != null ? mt.Size : 0;
+                string extra = mt != null && (mt.Kind == TypeKind.Decimal || mt.Kind == TypeKind.PDecimal) ? $",{mt.Places}" : "";
+                Console.WriteLine($"{pad}+{mb.Offset,-5} {mb.Name,-26} {kind}/{sz}{extra}"
+                    + (mt != null ? $" tag=0x{mt.Tag:X2}" : ""));
+                if (mt != null && mt.Kind == TypeKind.Group)
+                    DumpTypeMembers(mt, indent + 4);
+            }
         }
 
         private static int Symbols(string[] args)

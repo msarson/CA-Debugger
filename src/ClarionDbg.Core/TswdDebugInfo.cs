@@ -108,6 +108,56 @@ namespace ClarionDbg.Core
         public byte TypeCode;    // 0x08 = GROUP/RECORD; 0 = unknown
         public uint Size;        // 0 = unknown
         public List<DataField> Fields;   // non-null when TypeCode is GROUP/RECORD
+        public uint TypeRef;     // the record's typeRef (u32 at tag+1) — pointer to its TYPE record
+        public ClarionType Type; // resolved aggregate layout (non-null when typeRef resolves); byte-exact members
+    }
+
+    /// <summary>Kind of a resolved TSWD type record (see <see cref="ClarionType"/>).</summary>
+    public enum TypeKind { Unknown, Group, Array, String, Int, Uint, Float, Char, Decimal, PDecimal }
+
+    /// <summary>One member of a resolved GROUP type: name + byte offset within the group + its own type.</summary>
+    public sealed class TypeMember
+    {
+        public string Name;
+        public int Offset;
+        public ClarionType Type;
+    }
+
+    /// <summary>
+    /// A resolved TSWD TYPE record — followed from a 0x04/0x0C record's <c>typeRef</c> pointer (the u32 at
+    /// tag+1). This is the byte-exact aggregate layout (GROUP member offsets, array descriptors, DECIMAL
+    /// places) that lives in the TSWD blob itself — no .obj required. Decoded by
+    /// <see cref="TswdDebugInfo.ResolveType"/>; ported from clarion-pdb typeref_probe.parse_type.
+    /// </summary>
+    public sealed class ClarionType
+    {
+        public byte Tag;          // raw type-record tag: 0x08 group, 0x18 array/string desc, 0x23/0x24 decimal, 0x11-0x14 scalar
+        public TypeKind Kind;
+        public uint Size;         // total byte size of the type
+        public int Places;        // DECIMAL/PDECIMAL scale (digits after the point)
+        public byte ElemTag;      // array element type tag (0x18 descriptor)
+        public uint ElemSize;     // array element byte size
+        public int Length;        // array element count / STRING character count
+        public List<TypeMember> Members;  // GROUP members (non-null only when Kind == Group)
+
+        /// <summary>Map this resolved type to the flat (code,size,places) triple the shared engine value
+        /// renderer understands, so a leaf member renders identically to a top-level scalar of that type.</summary>
+        public void RenderHint(out byte code, out uint size, out int places)
+        {
+            code = 0; size = Size; places = 0;
+            switch (Kind)
+            {
+                case TypeKind.Int:      code = 0x11; break;
+                case TypeKind.Uint:     code = 0x12; break;
+                case TypeKind.Float:    code = 0x13; break;
+                case TypeKind.Char:     code = 0x18; break;                 // a bare CHAR -> STRING(size)
+                case TypeKind.String:   code = 0x18; size = (uint)Length; break;
+                case TypeKind.Decimal:  code = 0x23; places = Places; break;
+                case TypeKind.PDecimal: code = 0x24; places = Places; break;
+                case TypeKind.Group:    code = 0x08; break;
+                default:                code = 0x00; break;                 // array / unknown — composite
+            }
+        }
     }
 
     /// <summary>
@@ -125,6 +175,8 @@ namespace ClarionDbg.Core
         public byte Target;       // for a reference (0x16): the referent's type code (0x18 STRING, 0x08 group)
         public uint Size;         // char count (STRING) / byte width (scalar, DECIMAL); 0 = unknown
         public int Places;        // DECIMAL/PDECIMAL scale (digits after the point)
+        public uint TypeRef;      // the record's typeRef (u32 at tag+1) — pointer to its TYPE record
+        public ClarionType Type;  // resolved aggregate layout (non-null when typeRef resolves to a GROUP)
     }
 
     /// <summary>
@@ -205,6 +257,12 @@ namespace ClarionDbg.Core
 
         private uint U32(int rel) { return BitConverter.ToUInt32(_b, _base + rel); }
         private ushort U16(int rel) { return BitConverter.ToUInt16(_b, _base + rel); }
+
+        // Bounds-checked blob reads (return 0 when out of range) — used by the type-record walk, which
+        // chases pointers to arbitrary offsets and must never throw on a malformed/short blob.
+        private uint SU32(int rel) { int i = _base + rel; return (i >= 0 && i + 4 <= _b.Length) ? BitConverter.ToUInt32(_b, i) : 0; }
+        private int SI32(int rel) { int i = _base + rel; return (i >= 0 && i + 4 <= _b.Length) ? BitConverter.ToInt32(_b, i) : 0; }
+        private byte SB(int rel) { int i = _base + rel; return (i >= 0 && i < _b.Length) ? _b[i] : (byte)0; }
 
         public static TswdDebugInfo FromPe(PeImage pe)
         {
@@ -586,6 +644,20 @@ namespace ClarionDbg.Core
             var ds = new DataSymbol { Name = name, Rva = rva, ModuleIdx = modIdx };
             if (_base + o + 22 > _b.Length) return ds;
 
+            // The u32 at tag+1 (here o-4 — the "link" the legacy field-scan below only used as a match key)
+            // is the record's typeRef. Follow it for the byte-exact aggregate layout; when it resolves to a
+            // GROUP, take its members + size verbatim and skip the heuristic forward-scan. (The scan stays as
+            // a fallback for records whose typeRef doesn't resolve to a group.)
+            ds.TypeRef = U32(o - 4);
+            ds.Type = ResolveType(ds.TypeRef);
+            if (ds.Type != null && ds.Type.Kind == TypeKind.Group && ds.Type.Members != null && ds.Type.Members.Count > 0)
+            {
+                ds.TypeCode = 0x08;
+                if (ds.Type.Size > 0 && ds.Type.Size <= 0x100000) ds.Size = ds.Type.Size;
+                ds.Fields = BuildFieldsFromType(ds.Type);
+                return ds;
+            }
+
             // Type tail uses a discriminator byte @o+12 (matches clarion-pdb read_globals, the proven
             // typed-globals decoder):
             //   disc == 0x00  -> aggregate form:      kind @o+13, u32 size @o+14
@@ -644,6 +716,22 @@ namespace ClarionDbg.Core
                 if (ds.Fields[i].Size == 0 || ds.Fields[i].Size > span) ds.Fields[i].Size = span;
             }
             return ds;
+        }
+
+        /// <summary>Flatten a resolved GROUP's TOP-LEVEL members into the legacy <see cref="DataField"/> list
+        /// (name + offset + render code + size). The full nested tree lives in <see cref="DataSymbol.Type"/>;
+        /// this keeps the CLI text dump and the watch name-index working unchanged.</summary>
+        private static List<DataField> BuildFieldsFromType(ClarionType g)
+        {
+            var fields = new List<DataField>();
+            if (g == null || g.Members == null) return fields;
+            foreach (var mb in g.Members)
+            {
+                if (mb.Type == null) continue;
+                mb.Type.RenderHint(out byte code, out uint size, out int places);
+                fields.Add(new DataField { Name = mb.Name ?? "?", Offset = (uint)mb.Offset, TypeCode = code, Size = size });
+            }
+            return fields;
         }
 
         // local variables / parameters per procedure (entry RVA -> locals), from the +0x2C tree.
@@ -705,12 +793,107 @@ namespace ClarionDbg.Core
                         places = _b[_base + p + 23];
                     }
                     if (size > 0xFFFF) size = 0;   // implausible — a misread tail; treat as unknown
+                    // The u32 at tag+1 is the record's typeRef: follow it for the byte-exact aggregate
+                    // layout (GROUP members, array/DECIMAL geometry) the inline scalar decode can't give.
+                    uint typeRef = U32(p + 1);
+                    ClarionType aggr = (code == 0x08 || (code == 0x16 && target == 0x08))
+                        ? ResolveType(typeRef) : null;
                     outMap[cur].Add(new LocalSym { Name = nm, FrameOff = frameOff, TypeCode = code,
-                                                   Target = target, Size = size, Places = places });
+                                                   Target = target, Size = size, Places = places,
+                                                   TypeRef = typeRef, Type = aggr });
                 }
             }
             _locals = outMap;
             return _locals;
+        }
+
+        // ----- typeRef aggregate layout (GROUP/array/DECIMAL member offsets, from the blob alone) -----
+
+        // typeRef -> decoded type record (shared cache; also breaks reference cycles between records).
+        private Dictionary<uint, ClarionType> _typeCache;
+
+        /// <summary>
+        /// Follow a record's <c>typeRef</c> (the u32 at tag+1 of a 0x04/0x0C record) to its separate TYPE
+        /// record and decode the byte-exact aggregate layout: GROUP size/count/members, array/string
+        /// descriptors, DECIMAL places, scalar widths. Faithful port of clarion-pdb typeref_probe.parse_type.
+        ///
+        /// THE BASE (the bit everyone got wrong): every ref — typeRef, memberRef — is relative to the
+        /// record-stream START, which is dir[9] == <see cref="OffTable2C"/> (TOC +0x2C), and the ref points
+        /// DIRECTLY at the type record's tag byte (no +4). dir[8] (<see cref="OffSymbolNameArray"/>, TOC +0x28)
+        /// is a per-module base ARRAY that precedes the stream; using it is the module_count==1 degenerate
+        /// (dir[9] == dir[8] + 4*moduleCount) — it works on single-module test binaries and lands in
+        /// neighbouring records on multi-module apps. Returns null when the ref is out of range. Cached.
+        /// </summary>
+        public ClarionType ResolveType(uint typeRef)
+        {
+            if (_typeCache == null) _typeCache = new Dictionary<uint, ClarionType>();
+            return ParseType(typeRef, 0);
+        }
+
+        // A ref is valid if OffTable2C + ref lands inside the record stream [OffTable2C, OffTable34).
+        private bool ValidRef(uint refv)
+        {
+            long o = (long)OffTable2C + refv;
+            return o >= OffTable2C && o + 1 <= OffTable34 && _base + o + 1 <= _b.Length;
+        }
+
+        private ClarionType ParseType(uint typeRef, int depth)
+        {
+            if (_typeCache.TryGetValue(typeRef, out ClarionType cached)) return cached;
+            if (!ValidRef(typeRef) || depth > 16) return null;
+
+            var t = new ClarionType();
+            _typeCache[typeRef] = t;                 // seed BEFORE recursing so cyclic refs terminate
+            int o = OffTable2C + (int)typeRef;        // the type record's tag byte (blob-relative)
+            byte tag = SB(o);
+            t.Tag = tag;
+            switch (tag)
+            {
+                case 0x11: t.Kind = TypeKind.Int;   t.Size = SU32(o + 1); break;
+                case 0x12: t.Kind = TypeKind.Uint;  t.Size = SU32(o + 1); break;
+                case 0x13: t.Kind = TypeKind.Float; t.Size = SU32(o + 1); break;
+                case 0x14: t.Kind = TypeKind.Char;  t.Size = SU32(o + 1); break;
+                case 0x23: t.Kind = TypeKind.Decimal;  t.Size = SU32(o + 1); t.Places = SB(o + 5); break;
+                case 0x24: t.Kind = TypeKind.PDecimal; t.Size = SU32(o + 1); t.Places = SB(o + 5); break;
+                case 0x08:
+                {
+                    t.Kind = TypeKind.Group;
+                    t.Size = SU32(o + 1);
+                    uint count = SU32(o + 5);
+                    t.Members = new List<TypeMember>();
+                    int poolLen = OffSymbolNameArray - OffSymbolPool;
+                    int max = (int)Math.Min(count, 1024u);
+                    for (int i = 0; i < max; i++)
+                    {
+                        uint mref = SU32(o + 9 + 4 * i);
+                        if (!ValidRef(mref)) continue;
+                        int mb = OffTable2C + (int)mref;        // member record's tag byte
+                        byte mtag = SB(mb);
+                        if (mtag != 0x04 && mtag != 0x0C) continue;
+                        uint mType = SU32(mb + 1);
+                        uint mNameRef = SU32(mb + 5);
+                        int mOff = SI32(mb + 9);
+                        string mName = mNameRef >= 1 && poolLen > 0 && mNameRef < (uint)poolLen
+                            ? SymbolNameAt((int)mNameRef, poolLen) : null;
+                        t.Members.Add(new TypeMember { Name = mName, Offset = mOff, Type = ParseType(mType, depth + 1) });
+                    }
+                    break;
+                }
+                case 0x18:
+                {
+                    byte elemTag = SB(o + 9);
+                    uint elemSize = SU32(o + 10);
+                    int length = (int)SU32(o + 23);
+                    if (length < 0 || length > 0xFFFF) length = 0;
+                    if (elemTag == 0x14) { t.Kind = TypeKind.String; t.Length = length; t.Size = (uint)length; }
+                    else { t.Kind = TypeKind.Array; t.ElemTag = elemTag; t.ElemSize = elemSize; t.Length = length; t.Size = elemSize * (uint)length; }
+                    break;
+                }
+                default:
+                    t.Kind = TypeKind.Unknown;
+                    break;
+            }
+            return t;
         }
 
         // name -> resolved location for watch-by-name (statics + record fields, case-insensitive)
@@ -733,10 +916,31 @@ namespace ClarionDbg.Core
             {
                 if (!_dataNames.ContainsKey(ds.Name))
                     _dataNames[ds.Name] = new DataLocation { Rva = ds.Rva, TypeCode = ds.TypeCode, Size = ds.Size, Container = null, ModuleIdx = ds.ModuleIdx };
-                if (ds.Fields == null) continue;
-                foreach (var f in ds.Fields)
-                    if (!_dataNames.ContainsKey(f.Name))
-                        _dataNames[f.Name] = new DataLocation { Rva = ds.Rva + f.Offset, TypeCode = f.TypeCode, Size = f.Size, Container = ds.Name, ModuleIdx = ds.ModuleIdx };
+                if (ds.Type != null && ds.Type.Members != null)
+                    RegisterTypeLeaves(ds.Name, ds.Rva, ds.Type, ds.ModuleIdx);   // byte-exact, recurses nested groups
+                else if (ds.Fields != null)
+                    foreach (var f in ds.Fields)
+                        if (!_dataNames.ContainsKey(f.Name))
+                            _dataNames[f.Name] = new DataLocation { Rva = ds.Rva + f.Offset, TypeCode = f.TypeCode, Size = f.Size, Container = ds.Name, ModuleIdx = ds.ModuleIdx };
+            }
+        }
+
+        // Register every leaf member of a resolved GROUP by name -> absolute RVA, so watch-by-name resolves
+        // nested group fields too. Groups are recursed into; only leaves get a watchable location.
+        private void RegisterTypeLeaves(string container, uint groupRva, ClarionType g, int moduleIdx)
+        {
+            if (g == null || g.Members == null) return;
+            foreach (var mb in g.Members)
+            {
+                if (mb.Type == null || string.IsNullOrEmpty(mb.Name)) continue;
+                uint rva = (uint)(groupRva + mb.Offset);
+                if (mb.Type.Kind == TypeKind.Group)
+                    RegisterTypeLeaves(container, rva, mb.Type, moduleIdx);
+                else if (!_dataNames.ContainsKey(mb.Name))
+                {
+                    mb.Type.RenderHint(out byte code, out uint size, out int places);
+                    _dataNames[mb.Name] = new DataLocation { Rva = rva, TypeCode = code, Size = size, Container = container, ModuleIdx = moduleIdx };
+                }
             }
         }
 
