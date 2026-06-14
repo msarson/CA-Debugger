@@ -668,6 +668,12 @@ namespace ClarionDbg.Core
                 }
                 else if ((f3 & 0x80000000) != 0 && haveCur)         // negative 2nd field -> a local of `cur`
                 {
+                    // Skip compiler-synthesized references to GLOBAL entities (threaded globals like
+                    // GlobalResponse, file RELATE/ACCESS managers, record buffers). They live on the stack
+                    // as pointers but are NOT user locals; their mangled names are decorated $NAME' / NAME'
+                    // (leading '$' / trailing apostrophe) — neither is legal in a Clarion identifier.
+                    if (nm[0] == '$' || nm[nm.Length - 1] == '\'') continue;
+
                     int frameOff = BitConverter.ToInt32(_b, _base + p + 9);
                     byte code = _b[_base + p + 18];                 // typecode (after the storage byte @+17)
                     byte target = 0; uint size = 0; int places = 0;
