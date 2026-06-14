@@ -332,11 +332,14 @@ namespace ClarionDbg.Cli
                 _skipRunning = false;
                 if (_mode != StepMode.None && haveCtx && IsStepStop(va, ctx.Esp))
                 {
-                    // the skipped call returned straight onto a new statement boundary (a call as the last
-                    // op of a line → its return address is the next line's record). Stop here; otherwise we
-                    // resume stepping and trap only at the following instruction, missing the line.
+                    // The skipped call returned straight onto a stop boundary. For source-level Over this is a
+                    // new-statement record (a call as a line's last op → its return address is the next line's
+                    // record); for instruction-granular OverInstr it's simply the return address. Stop here
+                    // rather than resume stepping and trap only at the following instruction (missing it). The
+                    // INT3 advanced the thread's EIP to va+1, so commit the corrected EIP (=va) before pausing,
+                    // otherwise the next resume runs from mid-instruction and crashes the target.
                     Native.SetThreadContext(hThread, ref ctx);   // commit the corrected EIP (=va)
-                    StopStepAndPause(tid, hThread, ref ctx, "step");
+                    StopStepAndPause(tid, hThread, ref ctx, _mode == StepMode.OverInstr ? "stepi" : "step");
                 }
                 else if (_mode != StepMode.None && haveCtx)
                 {

@@ -30,6 +30,10 @@ namespace ClarionDbg.Cli
             if (_mode != StepMode.None && tid == _stepTid && !_skipRunning && haveCtx)
                 StepMachine(tid, hThread, ref ctx);
 
+            // 3) instruction step (stepi): we asked for exactly one TF step — pause here at the new EIP
+            else if (_instrStep && tid == _instrStepTid && haveCtx)
+                PausedWait(tid, hThread, ref ctx, haveCtx, "stepi"); // PausedWait clears _instrStep
+
             if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
             return Native.DBG_CONTINUE;
         }
@@ -79,7 +83,7 @@ namespace ClarionDbg.Cli
 
             // stop check: pause at the next statement boundary appropriate for the mode. Shared with the
             // call-skip return path (OnTempBp) so a boundary that lands on a skipped call's return address
-            // is not stepped past and missed.
+            // is not stepped past and missed. Instruction-granular OverInstr is handled inside IsStepStop.
             bool stop = IsStepStop(va, ctx.Esp);
 
             if (!stop && _stepCount >= MAX_STEPS)
@@ -90,7 +94,9 @@ namespace ClarionDbg.Cli
             }
             if (stop)
             {
-                StopStepAndPause(tid, hThread, ref ctx, "step");
+                // instruction-granular step reports as "stepi" so the host keeps focus in the
+                // disassembly view (no jump to the .clw); source-level steps report "step".
+                StopStepAndPause(tid, hThread, ref ctx, _mode == StepMode.OverInstr ? "stepi" : "step");
                 return;
             }
 
@@ -108,6 +114,12 @@ namespace ClarionDbg.Cli
         private bool IsStepStop(uint va, uint esp)
         {
             if (_mode == StepMode.None) return false;
+            // Instruction-granular step-over (disassembly view): purely address-based, independent of any
+            // source mapping — stop as soon as EIP has left the starting instruction (the call-skip brings
+            // us back at the return address). Checked before the source-resolution guard below so it stops
+            // even in runtime/library code with no .clw record.
+            if (_mode == StepMode.OverInstr)
+                return va != _stepStartVa && esp + ESP_SLACK >= _startEsp;
             var m = ModuleAt(va);
             uint rva = m != null ? va - m.LoadBase : va;
             int line = 0, mi = -1; uint recRva = 0;
@@ -160,6 +172,7 @@ namespace ClarionDbg.Cli
             _startModIdx = resolved ? mi : -1;
             _startModule = m;
             _prevVa = haveCtx ? ctx.Eip : 0;
+            _stepStartVa = _prevVa;
             _stepCount = 0;
             _skipRunning = false;
         }
