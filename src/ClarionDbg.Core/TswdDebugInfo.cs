@@ -586,15 +586,25 @@ namespace ClarionDbg.Core
             var ds = new DataSymbol { Name = name, Rva = rva, ModuleIdx = modIdx };
             if (_base + o + 22 > _b.Length) return ds;
 
-            byte flags = _b[_base + o + 12];
-            byte code = _b[_base + o + 13];
-            uint size = U32(o + 14);
-            if (flags != 0) return ds;                    // unrecognized tail — leave type unknown
+            // Type tail uses a discriminator byte @o+12 (matches clarion-pdb read_globals, the proven
+            // typed-globals decoder):
+            //   disc == 0x00  -> aggregate form:      kind @o+13, u32 size @o+14
+            //   disc != 0x00  -> scalar/string form:  kind == disc @o+12, u32 size @o+13
+            // The old code only read the aggregate offsets and bailed on disc != 0, so it dropped (or
+            // mis-sized) every scalar/string global.
+            byte disc = _b[_base + o + 12];
+            byte code; uint size;
+            if (disc == 0x00) { code = _b[_base + o + 13]; size = U32(o + 14); }
+            else              { code = disc;               size = U32(o + 13); }
+            // A STRING/CSTRING/PSTRING's real character count lives in the string leaf at o+36 (== tag+41,
+            // the SAME leaf read_locals uses for inline strings) — NOT the o+14/o+13 field, which holds a
+            // type descriptor (e.g. STRING(20) reads 8289 there). Take the leaf count when present.
+            if (code == 0x18 && _base + o + 40 <= _b.Length) size = U32(o + 36);
             if (size == 0 || size > 0x100000) return ds;  // implausible
             ds.TypeCode = code;
             ds.Size = size;
 
-            if (code != 0x08) return ds;                  // simple static — done
+            if (!(disc == 0x00 && code == 0x08)) return ds;   // only true aggregates carry member records
 
             // GROUP/RECORD: field count + child-ptr array, then the tag-0C field records.
             uint count = U32(o + 18);
