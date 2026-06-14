@@ -179,6 +179,11 @@
   .console .chdr { display:flex; align-items:center; gap:5px; background:var(--titlebar); padding:3px 12px; font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); border-bottom:1px solid var(--border); }
   .console .clog { flex:1; overflow:auto; padding:5px 12px; font-size:12px; }
   .clog div { white-space:pre-wrap; word-break:break-word; }
+  .console .chdr .cact { flex:none; cursor:pointer; opacity:0; font-size:11px; font-weight:600; text-transform:none; letter-spacing:0; color:#9a9a9a; padding:0 4px; border-radius:3px; transition:opacity .12s; }
+  .console .chdr:hover .cact { opacity:.7; }
+  .console .chdr .cact:hover { opacity:1; color:#fff; background:#3a3a3a; }
+  #copyLog { margin-left:auto; }
+  .console .chdr .sec-x { margin-left:6px; }
   .clog .hit { color:#73c991; } .clog .pause { color:#e2b341; } .clog .info { color:var(--fg-dim); } .clog .cmd { color:var(--name); } .clog .err { color:#f48771; }
 
   .datatip { position:fixed; z-index:50; background:var(--popup); border:1px solid var(--popup-border); border-radius:5px; box-shadow:0 6px 20px #0007; padding:6px 10px; font-size:12px; display:none; align-items:flex-start; gap:8px; max-width:560px; }
@@ -273,7 +278,7 @@
         <div class="src mono" id="src"></div>
       </div>
       <div class="console rsection" data-sec="console">
-        <div class="chdr"><span class="grip" draggable="true" title="Drag to reorder">⠿</span>Debug Console<span class="sec-x" title="Hide section">✕</span></div>
+        <div class="chdr"><span class="grip" draggable="true" title="Drag to reorder">⠿</span>Debug Console<span class="cact" id="copyLog" title="Copy console to clipboard">Copy</span><span class="cact" id="clearLog" title="Clear console">Clear</span><span class="sec-x" title="Hide section">✕</span></div>
         <div class="clog mono" id="clog"></div>
       </div>
     </div>
@@ -827,6 +832,18 @@
   // ---- console ----
   function logLine(level,text){ const c=$('clog'); const d=document.createElement('div'); d.className=level||'info'; d.textContent=text; c.appendChild(d); c.scrollTop=c.scrollHeight;
     while(c.childNodes.length>500) c.removeChild(c.firstChild); }
+
+  // copy / clear the console. Copy uses the async clipboard API where available (WebView2 is a secure
+  // context), with a hidden-textarea + execCommand fallback for older runtimes.
+  function consoleText(){ return Array.from($('clog').children).map(d=>d.textContent).join('\n'); }
+  function copyText(t){
+    try { if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(t); return; } } catch(e){}
+    const ta=document.createElement('textarea'); ta.value=t; ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.select(); try{ document.execCommand('copy'); }catch(e){} document.body.removeChild(ta);
+  }
+  function flashAct(el,msg){ const o=el.textContent; el.textContent=msg; setTimeout(()=>{ el.textContent=o; },900); }
+  $('copyLog').onclick=()=>{ const t=consoleText(); if(!t) return; copyText(t); flashAct($('copyLog'),'Copied'); };
+  $('clearLog').onclick=()=>{ $('clog').innerHTML=''; };
 
   // ---- unified hover data-tip ----
   const tip=$('datatip'); let tipTarget=null, tipTimer=null;
