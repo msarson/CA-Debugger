@@ -791,47 +791,12 @@ namespace ClarionDebugger.Services
                 w.Threaded = GetBool(json, "threaded");
                 w.TypeName = GetStr(json, "typeName");
                 w.Va = GetStr(json, "va");
-                int size = GetInt(json, "size");
-                byte[] bytes = ParseHexBytes(GetStr(json, "bytes"));
-                w.Value = RenderValue(w.TypeName, bytes, size);
+                // Value is now formatted engine-side by the shared Clarion value renderer (same one the
+                // Locals panel uses) and shipped ready-to-display — no separate client-side formatting.
+                w.Value = GetStr(json, "value");
                 return w;
             }
             catch { return null; }
-        }
-
-        /// <summary>Render raw target memory as a Clarion-typed display string for the watch pane.</summary>
-        public static string RenderValue(string typeName, byte[] b, int size)
-        {
-            if (b == null || b.Length == 0) return "(no data)";
-            try
-            {
-                switch (typeName)
-                {
-                    case "BYTE": return b[0].ToString();
-                    case "SHORT": return b.Length >= 2 ? BitConverter.ToInt16(b, 0).ToString() : b[0].ToString();
-                    case "LONG": return b.Length >= 4 ? BitConverter.ToInt32(b, 0).ToString() : "?";
-                    case "STRING":
-                    case "CSTRING":
-                    {
-                        int n = b.Length;
-                        if (typeName == "CSTRING") { int z = Array.IndexOf(b, (byte)0); if (z >= 0) n = z; }
-                        string s = System.Text.Encoding.GetEncoding(1252).GetString(b, 0, n).TrimEnd(' ', '\0');
-                        return "'" + s + "'";
-                    }
-                    case "GROUP":
-                        return "(group, " + size + " bytes)";
-                    default:
-                        return ToHexInline(b);
-                }
-            }
-            catch { return ToHexInline(b); }
-        }
-
-        private static string ToHexInline(byte[] b)
-        {
-            var sb = new System.Text.StringBuilder();
-            for (int i = 0; i < b.Length && i < 32; i++) { if (i > 0) sb.Append(' '); sb.Append(b[i].ToString("X2")); }
-            return sb.ToString();
         }
 
         /// <summary>Synchronously query the EXE's static data symbols (globals + file record buffers

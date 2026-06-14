@@ -32,8 +32,8 @@ namespace ClarionDbg.Cli
                         foreach (var l in locals)
                         {
                             uint va = (uint)((long)ctx.Ebp + l.FrameOff);
-                            string type = ClarionTypeLabel(l);
-                            string val = ReadLocalValue(l, va);
+                            string type = ClarionTypeLabel(l.TypeCode, l.Target, l.Size, l.Places);
+                            string val = FormatValueAt(l.TypeCode, l.Target, l.Size, l.Places, va);
                             rows.Add("{\"name\":" + Json.Str(l.Name)
                                 + ",\"type\":" + Json.Str(type)
                                 + ",\"value\":" + Json.Str(val)
@@ -53,73 +53,77 @@ namespace ClarionDbg.Cli
             }
         }
 
-        /// <summary>Render a Clarion type label from the decoded local (e.g. LONG, STRING(20), DECIMAL(7,2)).</summary>
-        private static string ClarionTypeLabel(LocalSym l)
+        /// <summary>The single Clarion type-label authority (e.g. LONG, STRING(20), DECIMAL(7,2)). Shared by
+        /// the Locals panel and watch/globals so every scope labels a type the same way.</summary>
+        internal static string ClarionTypeLabel(byte code, byte target, uint size, int places)
         {
-            switch (l.TypeCode)
+            switch (code)
             {
-                case 0x11: return l.Size == 2 ? "SHORT" : l.Size == 4 ? "LONG" : "SIGNED";
-                case 0x12: return l.Size == 1 ? "BYTE" : l.Size == 2 ? "USHORT" : l.Size == 4 ? "ULONG" : "UNSIGNED";
-                case 0x13: case 0x25: return l.Size == 8 ? "REAL" : "SREAL";
-                case 0x18: return "STRING(" + l.Size + ")";   // STRING/CSTRING/PSTRING not yet distinguished
-                case 0x23: return "DECIMAL(" + DecimalDigits(l.Size) + "," + l.Places + ")";
-                case 0x24: return "PDECIMAL(" + DecimalDigits(l.Size) + "," + l.Places + ")";
+                case 0x11: return size == 2 ? "SHORT" : size == 4 ? "LONG" : "SIGNED";
+                case 0x12: return size == 1 ? "BYTE" : size == 2 ? "USHORT" : size == 4 ? "ULONG" : "UNSIGNED";
+                case 0x13: case 0x25: return size == 8 ? "REAL" : "SREAL";
+                case 0x18: return "STRING(" + size + ")";   // STRING/CSTRING/PSTRING not yet distinguished
+                case 0x23: return "DECIMAL(" + DecimalDigits(size) + "," + places + ")";
+                case 0x24: return "PDECIMAL(" + DecimalDigits(size) + "," + places + ")";
                 case 0x16:
                     // a by-ref STRING is, to the user, just a STRING(N) — the pointer is an ABI detail
-                    if (l.Target == 0x18) return "STRING(" + l.Size + ")";
-                    return l.Target == 0x08 ? "&GROUP" : l.Target == 0x05 ? "&CLASS" : "&REF";
+                    if (target == 0x18) return "STRING(" + size + ")";
+                    return target == 0x08 ? "&GROUP" : target == 0x05 ? "&CLASS" : "&REF";
                 case 0x08: return "GROUP";
-                default:   return "TYPE(0x" + l.TypeCode.ToString("X2") + ")";
+                default:   return "TYPE(0x" + code.ToString("X2") + ")";
             }
         }
 
         // a Clarion packed-decimal of N bytes carries 2N-1 significant digits (the remaining nibble is the sign)
         private static int DecimalDigits(uint sizeBytes) { return sizeBytes > 0 ? (int)(sizeBytes * 2 - 1) : 0; }
 
-        /// <summary>Read and format a local's live value from <paramref name="va"/> on the paused thread.</summary>
-        private string ReadLocalValue(LocalSym l, uint va)
+        /// <summary>The single Clarion value-rendering authority: read and format a typed value live from
+        /// <paramref name="va"/> on the paused thread. Shared by the Locals panel and watch/globals (and, in
+        /// future, module data) so every scope renders a value identically. References (&amp;STRING) are
+        /// dereferenced here — which is why this lives engine-side: only the engine can read target memory.</summary>
+        internal string FormatValueAt(byte code, byte target, uint size, int places, uint va)
         {
             int len;
-            switch (l.TypeCode)
+            switch (code)
             {
-                case 0x18: len = (int)Math.Min(l.Size == 0 ? 1u : l.Size, 1024u); break;
-                case 0x23: case 0x24: len = (int)(l.Size == 0 ? 1u : l.Size); break;
-                case 0x11: case 0x12: case 0x13: case 0x25: len = (int)(l.Size == 0 ? 4u : l.Size); break;
+                case 0x18: len = (int)Math.Min(size == 0 ? 1u : size, 1024u); break;
+                case 0x23: case 0x24: len = (int)(size == 0 ? 1u : size); break;
+                case 0x11: case 0x12: case 0x13: case 0x25: len = (int)(size == 0 ? 4u : size); break;
                 case 0x16: len = 4; break;
-                default:   len = l.Size > 0 ? (int)Math.Min(l.Size, 64u) : 4; break;
+                default:   len = size > 0 ? (int)Math.Min(size, 64u) : 4; break;
             }
             var buf = new byte[len];
             int got = ReadBlock(va, buf);
             if (got <= 0) return "<unreadable>";
 
-            switch (l.TypeCode)
+            switch (code)
             {
                 case 0x11:   // signed
-                    if (l.Size == 1) return ((sbyte)buf[0]).ToString();
-                    if (l.Size == 2) return BitConverter.ToInt16(buf, 0).ToString();
+                    if (size == 1) return ((sbyte)buf[0]).ToString();
+                    if (size == 2) return BitConverter.ToInt16(buf, 0).ToString();
                     return BitConverter.ToInt32(buf, 0).ToString();
                 case 0x12:   // unsigned
-                    if (l.Size == 1) return buf[0].ToString();
-                    if (l.Size == 2) return BitConverter.ToUInt16(buf, 0).ToString();
+                    if (size == 1) return buf[0].ToString();
+                    if (size == 2) return BitConverter.ToUInt16(buf, 0).ToString();
                     return BitConverter.ToUInt32(buf, 0).ToString();
                 case 0x13: case 0x25:   // float (SREAL / REAL)
-                    return l.Size == 8 ? BitConverter.ToDouble(buf, 0).ToString("R")
-                                       : BitConverter.ToSingle(buf, 0).ToString("R");
+                    return size == 8 ? BitConverter.ToDouble(buf, 0).ToString("R")
+                                     : BitConverter.ToSingle(buf, 0).ToString("R");
                 case 0x18:   // STRING/CSTRING/PSTRING — show the text (cut at NUL, else trim trailing spaces)
                 {
                     int n = Array.IndexOf(buf, (byte)0, 0, got);
                     if (n < 0) n = got;
                     return "'" + Encoding.ASCII.GetString(buf, 0, n).TrimEnd(' ') + "'";
                 }
-                case 0x23: return FormatBcd(buf, got, l.Places, packed: false);  // DECIMAL (sign-first)
-                case 0x24: return FormatBcd(buf, got, l.Places, packed: true);   // PDECIMAL (sign-last)
+                case 0x23: return FormatBcd(buf, got, places, packed: false);  // DECIMAL (sign-first)
+                case 0x24: return FormatBcd(buf, got, places, packed: true);   // PDECIMAL (sign-last)
                 case 0x16:   // reference: the stack slot holds a pointer
                 {
                     uint ptr = BitConverter.ToUInt32(buf, 0);
                     if (ptr == 0) return "(null)";
-                    if (l.Target == 0x18)   // &STRING — deref and show the fixed N-char buffer (space-padded)
+                    if (target == 0x18)   // &STRING — deref and show the fixed N-char buffer (space-padded)
                     {
-                        int sn = l.Size > 0 && l.Size <= 4096 ? (int)l.Size : 256;
+                        int sn = size > 0 && size <= 4096 ? (int)size : 256;
                         var sbuf = new byte[sn];
                         int sg = ReadBlock(ptr, sbuf);
                         if (sg <= 0) return "&0x" + ptr.ToString("X") + " <unreadable>";

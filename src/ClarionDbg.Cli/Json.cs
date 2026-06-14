@@ -292,7 +292,7 @@ namespace ClarionDbg.Cli
         /// <summary>Watch-by-name value: instanceVa is the live (per-thread when threaded) address
         /// the bytes were read from; va is the link-time template address.</summary>
         public static string Watch(string name, bool found, uint templateVa, uint instanceVa, bool threaded,
-                                   byte typeCode, string typeName, uint size, byte[] bytes, int read)
+                                   byte typeCode, string typeName, uint size, string value, byte[] bytes, int read)
         {
             if (!found)
                 return "{\"event\":\"watch\",\"name\":" + Str(name) + ",\"found\":false}";
@@ -305,6 +305,7 @@ namespace ClarionDbg.Cli
               .Append(",\"type\":\"0x").Append(typeCode.ToString("X2")).Append('"')
               .Append(",\"typeName\":").Append(Str(typeName))
               .Append(",\"size\":").Append(size)
+              .Append(",\"value\":").Append(Str(value))   // engine-formatted (shared with the Locals panel)
               .Append(",\"read\":").Append(read)
               .Append(",\"bytes\":\"");
             for (int i = 0; i < read; i++) sb.Append(bytes[i].ToString("X2"));
