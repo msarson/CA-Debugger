@@ -94,6 +94,17 @@ namespace ClarionDebugger.Services
         public int FrameOff;      // frame-pointer-relative offset (diagnostic)
     }
 
+    /// <summary>The Locals payload for a pause: the current frame's locals (method/routine) plus, when in a
+    /// method/routine, the host procedure's locals (Clarion procedure data is in scope inside its methods).</summary>
+    public sealed class DebugLocals
+    {
+        public string Scope;       // current frame kind: method | routine | procedure
+        public string MethodName;  // current method/routine name (null when paused in the procedure body)
+        public List<DebugLocal> MethodItems = new List<DebugLocal>();
+        public string ProcName;    // host (or current) procedure name
+        public List<DebugLocal> ProcItems = new List<DebugLocal>();
+    }
+
     /// <summary>A watch-by-name result (Phase 3 'watch' command), value already rendered for display.</summary>
     public sealed class DebugWatch
     {
@@ -139,7 +150,7 @@ namespace ClarionDebugger.Services
         public event Action<List<DebugBreakpoint>> BreakpointListReceived;
         public event Action<uint, int, byte[]> MemoryReceived;     // addr, requested len, bytes
         public event Action<List<DebugStackFrame>> StackReceived;  // resolved call stack
-        public event Action<string, List<DebugLocal>> LocalsReceived; // EXPERIMENT: current proc's locals (proc, items)
+        public event Action<DebugLocals> LocalsReceived; // EXPERIMENT: current frame + host-procedure locals
         public event Action<string, List<DebugLocal>> ModuleDataReceived; // EXPERIMENT: current module's module-scope data (module, items)
         public event Action<DebugWatch> WatchReceived;             // watch-by-name value
         public event Action<DebugModule> ModuleLoaded;             // image mapped (EXE or DLL)
@@ -571,7 +582,14 @@ namespace ClarionDebugger.Services
                     break;
 
                 case "locals":
-                    LocalsReceived?.Invoke(GetStr(json, "proc"), ParseLocals(json));
+                    LocalsReceived?.Invoke(new DebugLocals
+                    {
+                        Scope = GetStr(json, "scope"),
+                        MethodName = GetStr(json, "method"),
+                        MethodItems = ParseLocals(ExtractArray(json, "methodItems")),
+                        ProcName = GetStr(json, "proc"),
+                        ProcItems = ParseLocals(ExtractArray(json, "procItems")),
+                    });
                     break;
 
                 case "moduledata":
@@ -766,6 +784,18 @@ namespace ClarionDebugger.Services
             }
             catch { }
             return list;
+        }
+
+        /// <summary>Slice out one named JSON array's body, e.g. ExtractArray(json,"methodItems") -> the text
+        /// between its [ and the matching ] — so the two locals arrays in a `locals` event parse separately.
+        /// Item objects carry only escaped-string values (no raw brackets), so the first ']' is the end.</summary>
+        private static string ExtractArray(string json, string key)
+        {
+            int i = json.IndexOf("\"" + key + "\":[", StringComparison.Ordinal);
+            if (i < 0) return "";
+            i += key.Length + 4;
+            int j = json.IndexOf(']', i);
+            return j < 0 ? "" : json.Substring(i, j - i);
         }
 
         private static List<DebugLocal> ParseLocals(string json)

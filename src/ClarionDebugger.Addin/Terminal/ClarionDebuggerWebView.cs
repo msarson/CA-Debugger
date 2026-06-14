@@ -118,24 +118,20 @@ namespace ClarionDebugger.Terminal
         private void OnSvcResumed(string mode) => UI(() => { Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
         private void OnSvcHit(DebugHit hit) => UI(() => Console("hit", "*** HIT  " + (hit.Resolved ? hit.Module + " line " + hit.Line : hit.Va)));
         private void OnSvcStack(List<DebugStackFrame> frames) => UI(() => OnStack(frames));
-        private void OnSvcLocals(string proc, List<DebugLocal> items) => UI(() =>
+        private void OnSvcLocals(DebugLocals d) => UI(() =>
         {
-            var sb = new StringBuilder("{\"type\":\"locals\",\"proc\":").Append(Str(proc)).Append(",\"items\":[");
-            for (int i = 0; i < items.Count; i++)
-            {
-                var l = items[i];
-                if (i > 0) sb.Append(',');
-                sb.Append("{\"name\":").Append(Str(l.Name))
-                  .Append(",\"type\":").Append(Str(l.Type))
-                  .Append(",\"value\":").Append(Str(l.Value)).Append('}');
-            }
+            var sb = new StringBuilder("{\"type\":\"locals\",\"scope\":").Append(Str(d.Scope))
+                .Append(",\"method\":").Append(Str(d.MethodName)).Append(",\"methodItems\":[");
+            AppendVarItems(sb, d.MethodItems);
+            sb.Append("],\"proc\":").Append(Str(d.ProcName)).Append(",\"procItems\":[");
+            AppendVarItems(sb, d.ProcItems);
             sb.Append("]}");
             Post(sb.ToString());
         });
-        private void OnSvcModuleData(string module, List<DebugLocal> items) => UI(() =>
+
+        private static void AppendVarItems(StringBuilder sb, List<DebugLocal> items)
         {
-            var sb = new StringBuilder("{\"type\":\"moduledata\",\"module\":").Append(Str(module)).Append(",\"items\":[");
-            for (int i = 0; i < items.Count; i++)
+            for (int i = 0; items != null && i < items.Count; i++)
             {
                 var l = items[i];
                 if (i > 0) sb.Append(',');
@@ -143,6 +139,11 @@ namespace ClarionDebugger.Terminal
                   .Append(",\"type\":").Append(Str(l.Type))
                   .Append(",\"value\":").Append(Str(l.Value)).Append('}');
             }
+        }
+        private void OnSvcModuleData(string module, List<DebugLocal> items) => UI(() =>
+        {
+            var sb = new StringBuilder("{\"type\":\"moduledata\",\"module\":").Append(Str(module)).Append(",\"items\":[");
+            AppendVarItems(sb, items);
             sb.Append("]}");
             Post(sb.ToString());
         });

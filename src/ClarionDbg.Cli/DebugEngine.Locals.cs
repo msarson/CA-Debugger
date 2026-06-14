@@ -9,48 +9,88 @@ namespace ClarionDbg.Cli
     {
         // ------------------------------------------------------------------ locals (Variables panel)
 
-        /// <summary>EXPERIMENT: locals — list the current procedure's local variables and their live values,
-        /// read from the paused frame ([EBP + frameOffset]). Decoded via TswdDebugInfo.ReadLocals (ported
-        /// from clarion-pdb). Emits a `locals` event for the host's Variables panel.</summary>
+        /// <summary>EXPERIMENT: locals — the current frame's local variables (and, when paused inside a
+        /// method/routine, the HOST procedure's locals too, since Clarion procedure data is in scope inside
+        /// its methods/routines). Reads each frame at [its EBP + frameOffset]; the host procedure's frame is
+        /// found by walking the EBP chain to the nearest Procedure-kind frame. Emits a `locals` event with
+        /// two groups (method + procedure) for the host's Variables panel.</summary>
         private void HandleLocalsCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx)
         {
-            var rows = new List<string>();
-            string proc = null;
+            string scope = null, methodName = null, procName = null;
+            var methodRows = new List<string>();
+            var procRows = new List<string>();
 
             if (haveCtx)
             {
-                uint eip = ctx.Eip;
-                var m = ModuleAt(eip);
+                var m = ModuleAt(ctx.Eip);
                 ProcSymbol sym;
-                if (m != null && m.Dbg != null && m.Dbg.ResolveSymbol(eip - m.LoadBase, out sym))
+                if (m != null && m.Dbg != null && m.Dbg.ResolveSymbol(ctx.Eip - m.LoadBase, out sym))
                 {
-                    proc = sym.Name;
-                    var map = m.Dbg.ReadLocals();
-                    List<LocalSym> locals;
-                    if (map.TryGetValue(sym.EntryRva, out locals))
+                    scope = sym.Kind.ToString().ToLowerInvariant();
+                    var curRows = LocalRowsFor(m, sym.EntryRva, ctx.Ebp);
+                    if (sym.Kind == SymbolKind.Procedure)
                     {
-                        foreach (var l in locals)
-                        {
-                            uint va = (uint)((long)ctx.Ebp + l.FrameOff);
-                            string type = ClarionTypeLabel(l.TypeCode, l.Target, l.Size, l.Places);
-                            string val = FormatValueAt(l.TypeCode, l.Target, l.Size, l.Places, va);
-                            rows.Add("{\"name\":" + Json.Str(l.Name)
-                                + ",\"type\":" + Json.Str(type)
-                                + ",\"value\":" + Json.Str(val)
-                                + ",\"frameOff\":" + l.FrameOff + "}");
-                        }
+                        procName = sym.Name; procRows = curRows;          // paused in the procedure body itself
+                    }
+                    else
+                    {
+                        methodName = sym.Name; methodRows = curRows;       // in a method/routine
+                        LoadedModule pm; ProcSymbol psym; uint pEbp;
+                        if (FindHostProcedureFrame(ctx.Ebp, out pm, out psym, out pEbp))
+                        { procName = psym.Name; procRows = LocalRowsFor(pm, psym.EntryRva, pEbp); }
                     }
                 }
             }
 
             if (EmitJson)
-                Console.WriteLine("@JSON {\"event\":\"locals\",\"proc\":" + Json.Str(proc)
-                    + ",\"items\":[" + string.Join(",", rows) + "]}");
+                Console.WriteLine("@JSON {\"event\":\"locals\""
+                    + ",\"scope\":" + Json.Str(scope)
+                    + ",\"method\":" + Json.Str(methodName)
+                    + ",\"methodItems\":[" + string.Join(",", methodRows) + "]"
+                    + ",\"proc\":" + Json.Str(procName)
+                    + ",\"procItems\":[" + string.Join(",", procRows) + "]}");
             else
+                Console.WriteLine($"  locals: method {methodName} ({methodRows.Count}) / proc {procName} ({procRows.Count})");
+        }
+
+        /// <summary>Build the JSON rows for one frame's locals — its proc's entry RVA keys the local set,
+        /// each value read live at [frameEbp + frameOffset]. Shared by the method and host-procedure groups.</summary>
+        private List<string> LocalRowsFor(LoadedModule m, uint entryRva, uint frameEbp)
+        {
+            var rows = new List<string>();
+            List<LocalSym> locals;
+            if (m != null && m.Dbg != null && m.Dbg.ReadLocals().TryGetValue(entryRva, out locals))
+                foreach (var l in locals)
+                {
+                    uint va = (uint)((long)frameEbp + l.FrameOff);
+                    string type = ClarionTypeLabel(l.TypeCode, l.Target, l.Size, l.Places);
+                    string val = FormatValueAt(l.TypeCode, l.Target, l.Size, l.Places, va);
+                    rows.Add("{\"name\":" + Json.Str(l.Name) + ",\"type\":" + Json.Str(type)
+                        + ",\"value\":" + Json.Str(val) + ",\"frameOff\":" + l.FrameOff + "}");
+                }
+            return rows;
+        }
+
+        /// <summary>Walk the EBP frame chain from <paramref name="startEbp"/> to the nearest Procedure-kind
+        /// frame (the host procedure of the current method/routine). The frame whose return address is at
+        /// [ebp+4] has its own base at [ebp]; that base is where its locals are read from.</summary>
+        private bool FindHostProcedureFrame(uint startEbp, out LoadedModule pm, out ProcSymbol psym, out uint pEbp)
+        {
+            pm = null; psym = null; pEbp = 0;
+            uint b = startEbp;
+            for (int i = 0; i < 64 && b != 0; i++)
             {
-                Console.WriteLine($"  locals ({rows.Count}) in {proc ?? "(unknown)"}:");
-                // (text view is JSON-free; the structured rows above carry the detail for the host)
+                uint callerPc = ReadU32(b + 4);     // return address into the caller frame
+                uint callerBase = ReadU32(b);       // the caller frame's EBP (saved here)
+                var rm = ModuleAt(callerPc);
+                ProcSymbol cs;
+                if (rm != null && rm.Dbg != null && rm.Dbg.ResolveSymbol(callerPc - rm.LoadBase, out cs)
+                    && cs.Kind == SymbolKind.Procedure)
+                { pm = rm; psym = cs; pEbp = callerBase; return true; }
+                if (callerBase <= b) break;          // bases strictly increase up the stack
+                b = callerBase;
             }
+            return false;
         }
 
         /// <summary>EXPERIMENT: moduledata — list the CURRENT module's module-scope data (the data declared

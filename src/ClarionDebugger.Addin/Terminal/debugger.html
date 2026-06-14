@@ -235,7 +235,7 @@
     <div class="sidebar col" id="colLeft">
       <details class="section" open data-sec="variables">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Variables<span class="hint" id="varsHint">file buffers</span><span class="sec-x" title="Hide section">✕</span></summary>
-        <div class="body" id="varTree"><div id="localsTree"></div><div id="moduleTree"></div><div id="bufTree"><div class="empty">Start a session to load file buffers.</div></div></div>
+        <div class="body" id="varTree"><div id="methodTree"></div><div id="localsTree"></div><div id="moduleTree"></div><div id="bufTree"><div class="empty">Start a session to load file buffers.</div></div></div>
       </details>
       <details class="section" open data-sec="watch">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Watch <span class="count" id="watchCount">0</span><span class="hint">type · ☆ tree · right-click</span><span class="sec-x" title="Hide section">✕</span></summary>
@@ -686,11 +686,14 @@
       rows.forEach(d=>d.style.display=open?'':'none'); };
   }
 
-  // ---- locals (current procedure's variables, refreshed each pause) ----
-  function buildVars(proc, items){
-    items=items||[]; const hint=$('varsHint');
-    if(hint) hint.textContent = items.length ? (proc ? proc+' · '+items.length+' locals' : items.length+' locals') : 'file buffers';
-    renderVarGroup($('localsTree'), 'Locals', null, items);
+  // ---- locals: current frame (method/routine) + host procedure, refreshed each pause ----
+  function buildVars(m){
+    const meth=m.methodItems||[], proc=m.procItems||[];
+    const methLabel = m.scope==='routine' ? 'Routine Data' : 'Method Data';
+    renderVarGroup($('methodTree'), methLabel, m.method, meth);   // empty when paused in the procedure body
+    renderVarGroup($('localsTree'), 'Procedure Data', m.proc, proc);
+    const hint=$('varsHint');
+    if(hint) hint.textContent = (meth.length||proc.length) ? (meth.length+proc.length)+' locals' : 'file buffers';
   }
 
   // ---- module-scope data (current module's DATA section, refreshed each pause) ----
@@ -919,7 +922,7 @@
       case 'resumed': break;
       case 'globals': buildVarTree(m.symbols); allSyms=collectSyms(m.symbols); break;
       case 'stack': buildStack(m.frames||[]); break;
-      case 'locals': buildVars(m.proc, m.items||[]); break;
+      case 'locals': buildVars(m); break;
       case 'moduledata': buildModuleData(m.module, m.items||[]); break;
       case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded); break;
       case 'bplist': buildBps(m.bps||[]); break;
