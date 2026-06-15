@@ -89,29 +89,6 @@ namespace ClarionDebugger.Services
         public string ResolvedPath; // generated .clw path via the active .red (or null)
     }
 
-    /// <summary>One local variable of the current procedure (EXPERIMENT: Locals/Variables panel),
-    /// value already rendered for display by the engine.</summary>
-    public sealed class DebugLocal
-    {
-        public string Name;       // e.g. LOC:COUNTER
-        public string Type;       // Clarion type label, e.g. LONG, STRING(20), DECIMAL(7,2)
-        public string Value;      // rendered value
-        public int FrameOff;      // frame-pointer-relative offset (diagnostic)
-    }
-
-    /// <summary>The Locals payload for a pause: the current frame's locals (method/routine) plus, when in a
-    /// method/routine, the host procedure's locals (Clarion procedure data is in scope inside its methods).
-    /// The item arrays are carried as the engine's RAW JSON (passed through to the WebView verbatim) so the
-    /// arbitrarily-nested GROUP <c>children</c> and lazy reference fields survive without a lossy re-parse.</summary>
-    public sealed class DebugLocals
-    {
-        public string Scope;          // current frame kind: method | routine | procedure
-        public string MethodName;     // current method/routine name (null when paused in the procedure body)
-        public string MethodItemsJson = ""; // raw JSON array body for the method frame's rows
-        public string ProcName;       // host (or current) procedure name
-        public string ProcItemsJson = "";   // raw JSON array body for the procedure frame's rows
-    }
-
     /// <summary>One decoded x86 instruction (EXPERIMENT: disassembly view).</summary>
     public sealed class DebugDisasmInstr
     {
@@ -181,7 +158,6 @@ namespace ClarionDebugger.Services
         public event Action<List<DebugBreakpoint>> BreakpointListReceived;
         public event Action<uint, int, byte[]> MemoryReceived;     // addr, requested len, bytes
         public event Action<List<DebugStackFrame>> StackReceived;  // resolved call stack
-        public event Action<DebugLocals> LocalsReceived; // EXPERIMENT: current frame + host-procedure locals
         public event Action<string, string> ModuleDataReceived; // current module's module-scope data (module, raw items JSON)
         public event Action<string, string> ExpandedReceived;   // lazy reference expansion (reqId, raw items JSON)
         public event Action<string, string> FrameLocalsReceived; // one call-stack frame's locals (reqId, raw items JSON)
@@ -415,9 +391,6 @@ namespace ClarionDebugger.Services
 
         /// <summary>Request the resolved call stack (paused only); result arrives via StackReceived.</summary>
         public bool RequestStack() { return SendCommand("stack"); }
-
-        /// <summary>EXPERIMENT: request the current procedure's locals (paused only); result arrives via LocalsReceived.</summary>
-        public bool RequestLocals() { return SendCommand("locals"); }
 
         /// <summary>EXPERIMENT: request the current module's module-scope data (paused only); via ModuleDataReceived.</summary>
         public bool RequestModuleData() { return SendCommand("moduledata"); }
@@ -703,19 +676,6 @@ namespace ClarionDebugger.Services
                     var frames = ParseStack(json);
                     foreach (var f in frames) f.ResolvedPath = ResolveModulePath(f.Module);
                     StackReceived?.Invoke(frames);
-                    break;
-
-                case "locals":
-                    // Pass the engine's item arrays through verbatim (balanced extraction) — nested GROUP
-                    // children + lazy reference fields would not survive a flat re-parse.
-                    LocalsReceived?.Invoke(new DebugLocals
-                    {
-                        Scope = GetStr(json, "scope"),
-                        MethodName = GetStr(json, "method"),
-                        MethodItemsJson = ExtractArrayBalanced(json, "methodItems"),
-                        ProcName = GetStr(json, "proc"),
-                        ProcItemsJson = ExtractArrayBalanced(json, "procItems"),
-                    });
                     break;
 
                 case "moduledata":

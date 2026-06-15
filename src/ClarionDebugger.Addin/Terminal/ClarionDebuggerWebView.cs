@@ -56,7 +56,6 @@ namespace ClarionDebugger.Terminal
             _svc.Resumed               += OnSvcResumed;
             _svc.HitReceived           += OnSvcHit;
             _svc.StackReceived         += OnSvcStack;
-            _svc.LocalsReceived        += OnSvcLocals;
             _svc.ModuleDataReceived    += OnSvcModuleData;
             _svc.ExpandedReceived      += OnSvcExpanded;
             _svc.FrameLocalsReceived   += OnSvcFrameLocals;
@@ -89,7 +88,6 @@ namespace ClarionDebugger.Terminal
             _svc.Resumed                -= OnSvcResumed;
             _svc.HitReceived            -= OnSvcHit;
             _svc.StackReceived          -= OnSvcStack;
-            _svc.LocalsReceived         -= OnSvcLocals;
             _svc.ModuleDataReceived     -= OnSvcModuleData;
             _svc.ExpandedReceived       -= OnSvcExpanded;
             _svc.FrameLocalsReceived    -= OnSvcFrameLocals;
@@ -124,16 +122,6 @@ namespace ClarionDebugger.Terminal
         private void OnSvcStack(List<DebugStackFrame> frames) => UI(() => OnStack(frames));
         // The engine already produces display-ready, escaped JSON rows (with nested children + lazy ref
         // fields); forward its array bodies verbatim so the structure survives intact.
-        private void OnSvcLocals(DebugLocals d) => UI(() =>
-        {
-            var sb = new StringBuilder("{\"type\":\"locals\",\"scope\":").Append(Str(d.Scope))
-                .Append(",\"method\":").Append(Str(d.MethodName)).Append(",\"methodItems\":[")
-                .Append(d.MethodItemsJson ?? "")
-                .Append("],\"proc\":").Append(Str(d.ProcName)).Append(",\"procItems\":[")
-                .Append(d.ProcItemsJson ?? "")
-                .Append("]}");
-            Post(sb.ToString());
-        });
 
         private void OnSvcModuleData(string module, string itemsJson) => UI(() =>
             Post("{\"type\":\"moduledata\",\"module\":" + Str(module) + ",\"items\":[" + (itemsJson ?? "") + "]}"));

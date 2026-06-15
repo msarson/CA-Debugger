@@ -494,10 +494,6 @@ namespace ClarionDbg.Cli
                         HandleStackCommand(parts, ref ctx, haveCtx);
                         break;
 
-                    case "locals": case "vars":
-                        HandleLocalsCommand(parts, ref ctx, haveCtx);
-                        break;
-
                     case "moduledata": case "moddata":
                         HandleModuleDataCommand(parts, ref ctx, haveCtx);
                         break;
