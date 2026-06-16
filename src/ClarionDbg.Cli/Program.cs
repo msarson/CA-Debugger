@@ -489,9 +489,10 @@ namespace ClarionDbg.Cli
             {
                 if (!string.Equals(args[i], "--bp", StringComparison.OrdinalIgnoreCase)) continue;
                 string v = args[i + 1];
-                int colon = v.LastIndexOf(':');
-                if (colon <= 0) { Console.Error.WriteLine($"--bp expects MODULE:LINE, got '{v}'"); return 1; }
-                specs.Add(new BpSpec(v.Substring(0, colon), (int)ParseNum(v.Substring(colon + 1))));
+                // "MODULE:LINE" optionally followed by "|c=<b64>|hm=eq|hv=5|t=<b64>" (advanced bp props)
+                BpSpec spec;
+                if (!BpSpec.TryParse(v, out spec)) { Console.Error.WriteLine($"--bp expects MODULE:LINE, got '{v}'"); return 1; }
+                specs.Add(spec);
             }
 
             string lineStr = GetOpt(args, "--line");

@@ -73,6 +73,13 @@ namespace ClarionDebugger.Services
         public int RequestedLine;
         public int Line;            // line actually planted (snapped to nearest code record)
         public string Path;         // full .clw path from the IDE gutter bookmark (null if unknown)
+
+        // ---- advanced breakpoint properties (conditional / hit count / tracepoint) ----
+        public string Condition;    // expression; pause only when true (null/empty = unconditional)
+        public string HitMode;      // null | "eq" (=N) | "gte" (>=N) | "mod" (every Nth)
+        public int HitValue;        // N for the hit-count rule
+        public string Trace;        // non-null ⇒ tracepoint: {var}-interpolated message logged on hit, never pauses
+        public int HitCount;        // engine-reported hit count (display only; updated via bp-set)
     }
 
     /// <summary>One resolved call-stack frame (Phase 3 'stack' command). proc/module null = unknown.</summary>
@@ -155,6 +162,7 @@ namespace ClarionDebugger.Services
         public event Action<DebugBreakpoint> BreakpointSet;
         public event Action<string, int> BreakpointRemoved;        // module, line
         public event Action<string, int, string> BreakpointError;  // module, line, error
+        public event Action<string, int, string, int> Traced;      // tracepoint fired: module, line, interpolated message, hit count
         public event Action<List<DebugBreakpoint>> BreakpointListReceived;
         public event Action<uint, int, byte[]> MemoryReceived;     // addr, requested len, bytes
         public event Action<List<DebugStackFrame>> StackReceived;  // resolved call stack
@@ -245,7 +253,8 @@ namespace ClarionDebugger.Services
                 foreach (var bp in breakpoints)
                 {
                     if (!IsValidModuleName(bp.Module)) continue; // blocks argument smuggling via module text
-                    args.Append(" --bp ").Append(bp.Module).Append(':').Append(bp.RequestedLine > 0 ? bp.RequestedLine : bp.Line);
+                    // spec = module:line plus any advanced props (condition/hit count/tracepoint), base64'd
+                    args.Append(" --bp ").Append(BuildBpSpec(bp));
                 }
             if (solutionDlls != null)
                 foreach (var dll in solutionDlls)
@@ -379,6 +388,15 @@ namespace ClarionDebugger.Services
         public bool RemoveBreakpoint(string module, int line)
         {
             return IsValidModuleName(module) && SendCommand("bp del " + module + ":" + line);
+        }
+
+        /// <summary>Add or update a breakpoint together with its advanced properties (condition / hit count
+        /// / tracepoint). Re-adding an existing module:line on the engine re-applies the properties, so this
+        /// doubles as the "edit properties" path for a live session. The spec is base64-encoded for free-text
+        /// fields, so it is a single space-free token safe for the line/space-split stdin protocol.</summary>
+        public bool SetBreakpoint(DebugBreakpoint bp)
+        {
+            return bp != null && IsValidModuleName(bp.Module) && SendCommand("bp add " + BuildBpSpec(bp));
         }
 
         public bool RequestBreakpointList() { return SendCommand("bp list"); }
@@ -612,18 +630,14 @@ namespace ClarionDebugger.Services
                     break;
 
                 case "bp-set":
-                    var bp = new DebugBreakpoint
-                    {
-                        Module = GetStr(json, "module"),
-                        RequestedLine = GetInt(json, "requestedLine"),
-                        Line = GetInt(json, "line")
-                    };
+                    var bp = ParseBpFields(json, GetStr(json, "module"));
                     lock (_breakpoints)
                     {
-                        bool known = false;
+                        DebugBreakpoint known = null;
                         foreach (var b in _breakpoints)
-                            if (b.Module == bp.Module && b.Line == bp.Line) { known = true; break; }
-                        if (!known) _breakpoints.Add(bp);
+                            if (b.Module == bp.Module && b.Line == bp.Line) { known = b; break; }
+                        if (known == null) _breakpoints.Add(bp);
+                        else CopyBpProps(bp, known);   // refresh props/hit count on a re-confirm (properties edit)
                     }
                     BreakpointSet?.Invoke(bp);
                     break;
@@ -638,6 +652,10 @@ namespace ClarionDebugger.Services
 
                 case "bp-error":
                     BreakpointError?.Invoke(GetStr(json, "module"), GetInt(json, "line"), GetStr(json, "error"));
+                    break;
+
+                case "trace":   // tracepoint fired in the engine — surface in the console, target keeps running
+                    Traced?.Invoke(GetStr(json, "module"), GetInt(json, "line"), GetStr(json, "message"), GetInt(json, "hitCount"));
                     break;
 
                 case "bp-list":
@@ -1062,19 +1080,66 @@ namespace ClarionDebugger.Services
             var list = new List<DebugBreakpoint>();
             try
             {
-                foreach (Match m in Regex.Matches(json, "\\{\"module\":\"([^\"]*)\",\"line\":(\\d+),\"requestedLine\":(\\d+)\\}"))
+                // Each bp object begins with {"module": — split on that boundary and parse fields per chunk.
+                // (GetStr/GetInt match the first occurrence within a chunk; brace chars inside a trace value
+                // like "count={count}" are harmless because the string regex stops at the closing quote.)
+                int idx = json.IndexOf("\"bps\"", StringComparison.Ordinal);
+                string arr = idx >= 0 ? json.Substring(idx) : json;
+                foreach (var chunk in Regex.Split(arr, "(?=\\{\"module\":)"))
                 {
-                    list.Add(new DebugBreakpoint
-                    {
-                        Module = m.Groups[1].Value,
-                        Line = int.Parse(m.Groups[2].Value),
-                        RequestedLine = int.Parse(m.Groups[3].Value)
-                    });
+                    if (chunk.IndexOf("\"module\":", StringComparison.Ordinal) < 0) continue;
+                    string mod = GetStr(chunk, "module");
+                    if (mod == null) continue;
+                    list.Add(ParseBpFields(chunk, mod));
                 }
             }
             catch { }
             return list;
         }
+
+        /// <summary>Build a breakpoint (location + advanced properties) from a single bp-set / bp-list
+        /// JSON object. Shared so bp-set and bp-list decode identically.</summary>
+        private static DebugBreakpoint ParseBpFields(string json, string module)
+        {
+            return new DebugBreakpoint
+            {
+                Module = module,
+                Line = GetInt(json, "line"),
+                RequestedLine = GetInt(json, "requestedLine"),
+                Condition = GetStr(json, "condition"),
+                HitMode = GetStr(json, "hitMode"),
+                HitValue = GetInt(json, "hitValue"),
+                Trace = GetStr(json, "trace"),
+                HitCount = GetInt(json, "hitCount")
+            };
+        }
+
+        /// <summary>Copy the advanced properties + live hit count from a freshly parsed breakpoint onto an
+        /// existing list entry (a re-confirmed bp-set is how a properties edit reaches the host).</summary>
+        private static void CopyBpProps(DebugBreakpoint from, DebugBreakpoint to)
+        {
+            to.Condition = from.Condition;
+            to.HitMode = from.HitMode;
+            to.HitValue = from.HitValue;
+            to.Trace = from.Trace;
+            to.HitCount = from.HitCount;
+        }
+
+        /// <summary>Build one space-free engine breakpoint spec token from a breakpoint's location +
+        /// properties: <c>module:line</c> optionally followed by <c>|c=&lt;b64&gt;|hm=eq|hv=5|t=&lt;b64&gt;</c>.
+        /// Free-text fields are base64(UTF-8) so they survive the line/space-split CLI + stdin protocol.</summary>
+        public static string BuildBpSpec(DebugBreakpoint bp)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append(bp.Module).Append(':').Append(bp.RequestedLine > 0 ? bp.RequestedLine : bp.Line);
+            if (!string.IsNullOrEmpty(bp.Condition)) sb.Append("|c=").Append(B64(bp.Condition));
+            if (bp.HitMode == "eq" || bp.HitMode == "gte" || bp.HitMode == "mod")
+                sb.Append("|hm=").Append(bp.HitMode).Append("|hv=").Append(bp.HitValue);
+            if (!string.IsNullOrEmpty(bp.Trace)) sb.Append("|t=").Append(B64(bp.Trace));
+            return sb.ToString();
+        }
+
+        private static string B64(string s) { return Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(s ?? string.Empty)); }
 
         private static uint ParseHexU32(string s)
         {
