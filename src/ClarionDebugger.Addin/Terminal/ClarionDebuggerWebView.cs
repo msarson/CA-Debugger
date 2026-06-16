@@ -64,6 +64,7 @@ namespace ClarionDebugger.Terminal
             _svc.BreakpointRemoved     += OnSvcBreakpointRemoved;
             _svc.BreakpointListReceived += OnSvcBreakpointList;
             _svc.BreakpointError       += OnSvcBreakpointError;
+            _svc.Traced                += OnSvcTraced;
             _svc.EngineError           += OnSvcEngineError;
             _svc.ModuleLoaded          += OnSvcModuleLoaded;
             _svc.ModuleUnloaded        += OnSvcModuleUnloaded;
@@ -96,6 +97,7 @@ namespace ClarionDebugger.Terminal
             _svc.BreakpointRemoved      -= OnSvcBreakpointRemoved;
             _svc.BreakpointListReceived -= OnSvcBreakpointList;
             _svc.BreakpointError        -= OnSvcBreakpointError;
+            _svc.Traced                 -= OnSvcTraced;
             _svc.EngineError            -= OnSvcEngineError;
             _svc.ModuleLoaded           -= OnSvcModuleLoaded;
             _svc.ModuleUnloaded         -= OnSvcModuleUnloaded;
@@ -136,6 +138,7 @@ namespace ClarionDebugger.Terminal
         private void OnSvcBreakpointRemoved(string m, int l) => UI(() => SendBps());
         private void OnSvcBreakpointList(List<DebugBreakpoint> list) => UI(() => SendBps());
         private void OnSvcBreakpointError(string m, int l, string err) => UI(() => Console("err", "breakpoint " + m + ":" + l + " — " + err));
+        private void OnSvcTraced(string m, int l, string msg, int hits) => UI(() => Console("trace", m + ":" + l + "  " + msg + "  (#" + hits + ")"));
         private void OnSvcEngineError(string msg) => UI(() => Console("err", "engine: " + msg));
         private void OnSvcModuleLoaded(DebugModule m) => UI(() => OnModuleLoaded(m));
         private void OnSvcModuleUnloaded(DebugModule m) => UI(() => Post("{\"type\":\"module-unloaded\",\"name\":" + Str(m.Name) + "}"));
@@ -320,6 +323,7 @@ namespace ClarionDebugger.Terminal
                     case "jump": Jump(data); break;
                     case "openbp": OpenBp(data); break;
                     case "bpremove": RemoveBp(data); break;
+                    case "bpprops": SetBpProps(data); break;
                     case "proclist":   // user pressed ↻ — re-resolve FRESH so the list tracks a project/solution switch
                         TryAutoResolveExe();   // (re-resolves against the active project even if _exe was already set)
                         if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);
@@ -599,6 +603,46 @@ namespace ClarionDebugger.Terminal
                 OnGutterBpRemoved(module, line); // no gutter bookmark matched — keep the pane/engine consistent
         }
 
+        /// <summary>Apply advanced breakpoint properties (condition / hit count / tracepoint) from the
+        /// BREAKPOINTS pane's properties editor. Data is a JSON object
+        /// {module,line,condition,hitMode,hitValue,trace}. The host-side pending list is the source of
+        /// truth for properties (the gutter only stores module:line), so they persist across a restart and
+        /// are re-applied via the launch spec; on a live session they are pushed to the engine immediately.</summary>
+        private void SetBpProps(string data)
+        {
+            if (string.IsNullOrEmpty(data)) return;
+            string module = JsonVal(data, "module");
+            if (string.IsNullOrEmpty(module)) return;
+            int line;
+            if (!int.TryParse(JsonVal(data, "line") ?? "", out line)) return;
+
+            string condition = JsonVal(data, "condition");
+            string hitMode = JsonVal(data, "hitMode");
+            int hitValue; int.TryParse(JsonVal(data, "hitValue") ?? "0", out hitValue);
+            string trace = JsonVal(data, "trace");
+
+            // normalize empties to null = "no such property"
+            if (string.IsNullOrWhiteSpace(condition)) condition = null;
+            if (hitMode != "eq" && hitMode != "gte" && hitMode != "mod") hitMode = null;
+            if (string.IsNullOrWhiteSpace(trace)) trace = null;
+
+            // update (or create) the pending entry — the persistent source of truth for properties
+            DebugBreakpoint target = null;
+            foreach (var b in _pending) if (SameBp(b, module, line)) { target = b; break; }
+            if (target == null)
+            {
+                target = new DebugBreakpoint { Module = module, RequestedLine = line, Line = line };
+                _pending.Add(target);
+            }
+            target.Condition = condition;
+            target.HitMode = hitMode;
+            target.HitValue = hitValue;
+            target.Trace = trace;
+
+            if (_svc.IsRunning) _svc.SetBreakpoint(target); // engine echoes bp-set → pane refresh
+            SendBps();                                      // idle: reflect the pending entry immediately
+        }
+
         // ------------------------------------------------------------------ host → page
 
         private void OnPaused(DebugPause p)
@@ -701,7 +745,12 @@ namespace ClarionDebugger.Terminal
                 sb.Append("{\"module\":").Append(Str(b.Module))
                   .Append(",\"line\":").Append(b.Line)
                   .Append(",\"requested\":").Append(b.RequestedLine)
-                  .Append(",\"path\":").Append(Str(path)).Append('}');
+                  .Append(",\"path\":").Append(Str(path))
+                  .Append(",\"condition\":").Append(Str(b.Condition))
+                  .Append(",\"hitMode\":").Append(Str(b.HitMode))
+                  .Append(",\"hitValue\":").Append(b.HitValue)
+                  .Append(",\"trace\":").Append(Str(b.Trace))
+                  .Append(",\"hitCount\":").Append(b.HitCount).Append('}');
             }
             sb.Append("]}");
             Post(sb.ToString());

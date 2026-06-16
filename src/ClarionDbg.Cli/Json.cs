@@ -162,25 +162,47 @@ namespace ClarionDbg.Cli
             return "{\"event\":\"regs\",\"regs\":" + (regsJson ?? "null") + "}";
         }
 
-        public static string BpSet(string module, int requestedLine, int line, List<uint> rvas)
+        public static string BpSet(UserBreakpoint bp)
         {
             var sb = new StringBuilder();
-            sb.Append("{\"event\":\"bp-set\",\"module\":").Append(Str(module))
-              .Append(",\"requestedLine\":").Append(requestedLine)
-              .Append(",\"line\":").Append(line)
+            sb.Append("{\"event\":\"bp-set\",\"module\":").Append(Str(bp.Module))
+              .Append(",\"requestedLine\":").Append(bp.RequestedLine)
+              .Append(",\"line\":").Append(bp.Line)
               .Append(",\"rvas\":[");
-            for (int i = 0; i < rvas.Count; i++)
+            for (int i = 0; i < bp.Rvas.Count; i++)
             {
                 if (i > 0) sb.Append(',');
-                sb.Append("\"0x").Append(rvas[i].ToString("X")).Append('"');
+                sb.Append("\"0x").Append(bp.Rvas[i].ToString("X")).Append('"');
             }
-            sb.Append("]}");
+            sb.Append(']');
+            AppendBpProps(sb, bp);
+            sb.Append('}');
             return sb.ToString();
+        }
+
+        /// <summary>Serialize the advanced breakpoint properties (condition / hit count / tracepoint /
+        /// live hit count) shared by bp-set and bp-list. Always emitted so the host can clear stale
+        /// values when a property is removed.</summary>
+        private static void AppendBpProps(StringBuilder sb, UserBreakpoint bp)
+        {
+            sb.Append(",\"condition\":").Append(Str(bp.Condition))
+              .Append(",\"hitMode\":").Append(Str(bp.HitMode))
+              .Append(",\"hitValue\":").Append(bp.HitValue)
+              .Append(",\"trace\":").Append(Str(bp.Trace))
+              .Append(",\"hitCount\":").Append(bp.HitCount);
         }
 
         public static string BpDel(string module, int line)
         {
             return "{\"event\":\"bp-del\",\"module\":" + Str(module) + ",\"line\":" + line + "}";
+        }
+
+        /// <summary>A tracepoint fired: the interpolated message + the breakpoint's live hit count. The
+        /// host surfaces this in the debugger console without the target ever pausing.</summary>
+        public static string Trace(string module, int line, string message, int hitCount)
+        {
+            return "{\"event\":\"trace\",\"module\":" + Str(module) + ",\"line\":" + line
+                 + ",\"message\":" + Str(message) + ",\"hitCount\":" + hitCount + "}";
         }
 
         public static string BpError(string module, int line, string error)
@@ -198,8 +220,9 @@ namespace ClarionDbg.Cli
                 if (i > 0) sb.Append(',');
                 sb.Append("{\"module\":").Append(Str(bps[i].Module))
                   .Append(",\"line\":").Append(bps[i].Line)
-                  .Append(",\"requestedLine\":").Append(bps[i].RequestedLine)
-                  .Append('}');
+                  .Append(",\"requestedLine\":").Append(bps[i].RequestedLine);
+                AppendBpProps(sb, bps[i]);
+                sb.Append('}');
             }
             sb.Append("]}");
             return sb.ToString();

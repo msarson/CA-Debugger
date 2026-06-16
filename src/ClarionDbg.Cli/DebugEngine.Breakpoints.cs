@@ -14,18 +14,42 @@ namespace ClarionDbg.Cli
         /// <summary>Resolve module:line to RVAs (snapping to the nearest record line) and register it.
         /// If the owning image is not yet loaded, the breakpoint is held PENDING and resolved when that
         /// image maps (see <see cref="ResolvePendingFor"/>).</summary>
-        private void AddBreakpoint(string module, int line)
+        /// <summary>Apply advanced breakpoint properties (condition / hit count / tracepoint) to a
+        /// breakpoint and reset its runtime hit counter (re-configuring restarts the count). Empty
+        /// strings normalize to null = "no such property".</summary>
+        private static void ApplyBpProps(UserBreakpoint bp, string condition, string hitMode, int hitValue, string trace)
+        {
+            bp.Condition = string.IsNullOrEmpty(condition) ? null : condition;
+            bp.HitMode = (hitMode == "eq" || hitMode == "gte" || hitMode == "mod") ? hitMode : null;
+            bp.HitValue = hitValue;
+            bp.Trace = string.IsNullOrEmpty(trace) ? null : trace;
+            bp.HitCount = 0;
+        }
+
+        private void EmitBpSet(UserBreakpoint bp)
+        {
+            if (EmitJson) Console.WriteLine("@JSON " + Json.BpSet(bp));
+        }
+
+        private void AddBreakpoint(string module, int line, string condition = null, string hitMode = null, int hitValue = 0, string trace = null)
         {
             var owner = OwnerOfModule(module);
             if (owner == null)
             {
                 // No loaded/known image carries this compiland yet — defer. Arms when its DLL loads.
                 foreach (var b in _bps)
-                    if (Eq(b.Module, module) && (b.RequestedLine == line || b.Line == line)) return; // dup
+                    if (Eq(b.Module, module) && (b.RequestedLine == line || b.Line == line))
+                    {
+                        // re-add of a pending bp = a properties update; re-apply and re-confirm
+                        ApplyBpProps(b, condition, hitMode, hitValue, trace);
+                        EmitBpSet(b);
+                        return;
+                    }
                 var pend = new UserBreakpoint { Module = module, ModuleIdx = -1, RequestedLine = line, Line = line };
+                ApplyBpProps(pend, condition, hitMode, hitValue, trace);
                 _bps.Add(pend);
                 Console.WriteLine($"bp: {module}:{line} pending — owning image not loaded yet");
-                if (EmitJson) Console.WriteLine("@JSON " + Json.BpSet(module, line, line, pend.Rvas));
+                EmitBpSet(pend);
                 return;
             }
 
@@ -57,18 +81,21 @@ namespace ClarionDbg.Cli
             foreach (var b in _bps)
                 if (b.Owner == owner && b.ModuleIdx == mi && b.RequestedLine == line)
                 {
-                    if (EmitJson) Console.WriteLine("@JSON " + Json.BpSet(b.Module, line, b.Line, b.Rvas));
+                    // re-add of the same line = a properties update; re-apply and re-confirm
+                    ApplyBpProps(b, condition, hitMode, hitValue, trace);
+                    EmitBpSet(b);
                     return;
                 }
 
             var bp = new UserBreakpoint { Module = canon, ModuleIdx = mi, Owner = owner, RequestedLine = line, Line = planted };
             bp.Rvas.AddRange(rvas);
+            ApplyBpProps(bp, condition, hitMode, hitValue, trace);
             _bps.Add(bp);
             if (owner.LoadBase != 0) PlantBp(bp);
             if (planted != line)
                 Console.WriteLine($"bp: line {line} has no code record in {canon}; breakpoint moved to nearest line {planted}");
             Console.WriteLine($"bp: set {canon}:{planted} ({bp.Rvas.Count} address(es))");
-            if (EmitJson) Console.WriteLine("@JSON " + Json.BpSet(canon, line, planted, bp.Rvas));
+            EmitBpSet(bp);
         }
 
         /// <summary>Register a raw RVA (legacy --rva/--entry) as an anonymous EXE breakpoint.</summary>
@@ -201,7 +228,7 @@ namespace ClarionDbg.Cli
                 bp.Rvas.AddRange(rvas);
                 if (m.LoadBase != 0) PlantBp(bp);
                 Console.WriteLine($"bp: armed pending {bp.Module}:{bp.Line} ({bp.Rvas.Count} address(es)) in {m.Name}");
-                if (EmitJson) Console.WriteLine("@JSON " + Json.BpSet(bp.Module, bp.RequestedLine, bp.Line, bp.Rvas));
+                EmitBpSet(bp);
             }
         }
 
@@ -242,6 +269,27 @@ namespace ClarionDbg.Cli
             }
             _rearm[tid] = new Rearm { Va = va, IsTemp = false };
             CancelStep(); // a real BP hit supersedes any in-flight step (drops temp re-arms, not this one)
+
+            // Advanced breakpoints: evaluate condition / hit count / tracepoint BEFORE reporting a hit.
+            // A non-pausing outcome (condition false, hit-count unmet, or tracepoint logged) resumes
+            // silently — re-arming via the same single-step the non-interactive path uses — so the UI
+            // never sees a stop for a breakpoint that didn't actually pause.
+            var ubp = FindBpAt(m, rva);
+            if (ubp != null && (ubp.Condition != null || ubp.HitMode != null || ubp.Trace != null))
+            {
+                if (!ShouldPauseAtBp(ubp))
+                {
+                    if (haveCtx)
+                    {
+                        Native.GetThreadContext(hThread, ref ctx);
+                        ctx.EFlags |= TRAP_FLAG;
+                        Native.SetThreadContext(hThread, ref ctx);
+                    }
+                    if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
+                    return Native.DBG_CONTINUE;
+                }
+                EmitBpSet(ubp); // pausing — push the updated live hit count to the breakpoints pane
+            }
 
             ReportHit(m, rva, va, ref ctx, haveCtx);
 

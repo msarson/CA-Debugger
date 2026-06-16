@@ -7,12 +7,58 @@ using ClarionDbg.Core;
 
 namespace ClarionDbg.Cli
 {
-    /// <summary>A requested breakpoint location (module:line), resolved and planted by the engine.</summary>
+    /// <summary>A requested breakpoint location (module:line) plus optional advanced properties
+    /// (conditional / hit count / tracepoint), resolved and planted by the engine.</summary>
     internal sealed class BpSpec
     {
         public readonly string Module;
         public readonly int Line;
+        public string Condition;   // null = unconditional
+        public string HitMode;     // null | "eq" (=N) | "gte" (>=N) | "mod" (every Nth)
+        public int HitValue;       // N for the hit-count rule
+        public string Trace;       // non-null = tracepoint message
         public BpSpec(string module, int line) { Module = module; Line = line; }
+
+        /// <summary>Parse one space-free breakpoint spec token: <c>module:line</c> optionally followed by
+        /// <c>|c=&lt;base64&gt;|hm=eq|hv=5|t=&lt;base64&gt;</c>. Free-text fields (condition, trace) are
+        /// base64(UTF-8) so they survive the line/space-split CLI + stdin protocol without quoting or
+        /// injection risk. Returns false if the head isn't a valid module:line.</summary>
+        public static bool TryParse(string spec, out BpSpec result)
+        {
+            result = null;
+            if (string.IsNullOrEmpty(spec)) return false;
+            var segs = spec.Split('|');
+            string head = segs[0];
+            int colon = head.LastIndexOf(':');
+            if (colon <= 0) return false;
+            int line;
+            if (!int.TryParse(head.Substring(colon + 1), out line)) return false;
+            var bp = new BpSpec(head.Substring(0, colon), line);
+            for (int i = 1; i < segs.Length; i++)
+            {
+                string s = segs[i];
+                int eq = s.IndexOf('=');
+                if (eq <= 0) continue;
+                string key = s.Substring(0, eq);
+                string val = s.Substring(eq + 1);
+                switch (key)
+                {
+                    case "c":  bp.Condition = DecodeB64(val); break;
+                    case "hm": bp.HitMode = (val == "eq" || val == "gte" || val == "mod") ? val : null; break;
+                    case "hv": int hv; bp.HitValue = int.TryParse(val, out hv) ? hv : 0; break;
+                    case "t":  bp.Trace = DecodeB64(val); break;
+                }
+            }
+            result = bp;
+            return true;
+        }
+
+        private static string DecodeB64(string b64)
+        {
+            if (string.IsNullOrEmpty(b64)) return null;
+            try { return System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(b64)); }
+            catch { return null; }
+        }
     }
 
     /// <summary>One resolved call-stack frame (frame 0 = current EIP, rest = return addresses).</summary>
@@ -38,6 +84,13 @@ namespace ClarionDbg.Cli
         public int Line;               // the line actually planted (snapped to nearest record line)
         public readonly List<uint> Rvas = new List<uint>();   // code RVAs within Owner
         public bool Pending { get { return Owner == null; } } // owning image not yet loaded/resolved
+
+        // ---- advanced breakpoint properties (conditional / hit count / tracepoint) ----
+        public string Condition;       // expression evaluated on hit; false ⇒ resume silently (null = unconditional)
+        public string HitMode;         // null | "eq" (=N) | "gte" (>=N) | "mod" (every Nth); applied AFTER condition passes
+        public int HitValue;           // N for the hit-count rule
+        public string Trace;           // non-null ⇒ tracepoint: interpolate {var} tokens, log to Console, resume (never pause)
+        public int HitCount;           // runtime: times this breakpoint's condition has been satisfied (drives HitMode)
     }
 
     /// <summary>
@@ -163,7 +216,7 @@ namespace ClarionDbg.Cli
             if (_interactive) StartStdinReader();
 
             // resolve module:line specs up front so bp-set/bp-error report before launch
-            foreach (var s in _initialSpecs) AddBreakpoint(s.Module, s.Line);
+            foreach (var s in _initialSpecs) AddBreakpoint(s.Module, s.Line, s.Condition, s.HitMode, s.HitValue, s.Trace);
             // raw RVAs (legacy --rva/--entry/--all-entries) become anonymous breakpoints
             foreach (var rva in _rawRvas) AddRawBreakpoint(rva);
 
@@ -605,17 +658,15 @@ namespace ClarionDbg.Cli
                 return;
             }
             if (parts.Length < 3) { EmitError("bp " + sub + " expects module:line"); return; }
-            string spec = parts[2];
-            int colon = spec.LastIndexOf(':');
-            int lineNo;
-            if (colon <= 0 || !int.TryParse(spec.Substring(colon + 1), out lineNo))
+            // spec = "module:line" optionally followed by "|c=<b64>|hm=eq|hv=5|t=<b64>" (one space-free token)
+            BpSpec spec;
+            if (!BpSpec.TryParse(parts[2], out spec))
             {
-                EmitError("bp " + sub + " expects module:line, got '" + spec + "'");
+                EmitError("bp " + sub + " expects module:line, got '" + parts[2] + "'");
                 return;
             }
-            string module = spec.Substring(0, colon);
-            if (sub == "add") AddBreakpoint(module, lineNo);
-            else if (sub == "del" || sub == "remove" || sub == "rm") RemoveBreakpoint(module, lineNo);
+            if (sub == "add") AddBreakpoint(spec.Module, spec.Line, spec.Condition, spec.HitMode, spec.HitValue, spec.Trace);
+            else if (sub == "del" || sub == "remove" || sub == "rm") RemoveBreakpoint(spec.Module, spec.Line);
             else EmitError("unknown bp subcommand: " + sub);
         }
 

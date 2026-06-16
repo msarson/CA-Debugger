@@ -142,6 +142,7 @@
   .frame .kind { margin-left:auto; color:var(--fg-dim); font-size:10px; border:1px solid #ffffff1f; border-radius:3px; padding:0 5px; }
   .frame.unknown .fn { color:var(--fg-dim); font-style:italic; }
 
+  .bpitem { border-bottom:1px solid transparent; }
   .bp { display:flex; align-items:center; gap:7px; padding:3px 8px 3px 14px; font-size:13px; }
   .bp:hover { background:var(--hover); }
   .bp .chk { width:13px; height:13px; border-radius:3px; border:1px solid #888; flex:none; display:inline-flex; align-items:center; justify-content:center; }
@@ -160,8 +161,25 @@
   .proc .procname { color:var(--name); overflow:hidden; text-overflow:ellipsis; }
   .proc .procfile { margin-left:auto; flex:none; color:var(--blue); cursor:pointer; text-decoration:underline; font-size:11px; }
   .proc .procfile:hover { filter:brightness(1.25); }
-  .bp .rm { margin-left:auto; flex:none; cursor:pointer; color:var(--muted,#888); opacity:.55; padding:0 4px; border-radius:3px; font-size:12px; line-height:1; }
+  .bp .rm { flex:none; cursor:pointer; color:var(--muted,#888); opacity:.55; padding:0 4px; border-radius:3px; font-size:12px; line-height:1; }
   .bp .rm:hover { color:#fff; background:#e51400; opacity:1; }
+  /* advanced breakpoint indicators + properties editor */
+  .bp .bpcfg { flex:none; margin-left:auto; cursor:pointer; color:var(--muted,#888); opacity:.55; padding:0 4px; border-radius:3px; font-size:12px; line-height:1; }
+  .bp .bpcfg:hover { color:#fff; background:#3a3a3a; opacity:1; }
+  .bp .badge { flex:none; font-size:10px; line-height:1; padding:1px 4px; border-radius:3px; background:var(--btnhover,#2d2d2d); cursor:help; }
+  .bp .badge.cond { color:#c586c0; } .bp .badge.hits { color:var(--num,#b5cea8); } .bp .badge.trace { color:#4fc1ff; } .bp .badge.cnt { color:#e2b341; }
+  .bp.has-adv .chk.on { background:#c586c0; border-color:#c586c0; }        /* conditional/hit-count bp dot */
+  .bp.is-trace .chk.on { background:#4fc1ff; border-color:#4fc1ff; }       /* tracepoint dot (overrides) */
+  .bpedit { padding:6px 10px 8px 14px; border-bottom:1px solid var(--border); background:var(--bg); display:flex; flex-direction:column; gap:5px; font-size:11.5px; }
+  .bpedit label { display:flex; align-items:center; gap:6px; color:var(--fg-dim); }
+  .bpedit label > span { flex:none; width:62px; }
+  .bpedit input[type=text] { flex:1; min-width:0; background:var(--titlebar); border:1px solid var(--border); color:var(--fg); border-radius:3px; padding:2px 5px; font:inherit; }
+  .bpedit select { background:var(--titlebar); border:1px solid var(--border); color:var(--fg); border-radius:3px; padding:2px 4px; font:inherit; }
+  .bpedit input.bp-hv { width:56px; background:var(--titlebar); border:1px solid var(--border); color:var(--fg); border-radius:3px; padding:2px 5px; font:inherit; }
+  .bpedit .acts { display:flex; gap:6px; justify-content:flex-end; margin-top:1px; }
+  .bpedit button { cursor:pointer; background:var(--btnhover,#2d2d2d); border:1px solid var(--border); color:var(--fg); border-radius:3px; padding:2px 10px; font:inherit; }
+  .bpedit button.bp-save { background:#0e639c; border-color:#0e639c; color:#fff; }
+  .bpedit button:hover { filter:brightness(1.2); }
 
   .regs { display:grid; grid-template-columns:repeat(2,1fr); gap:1px 14px; padding:4px 14px; }
   .reg { font-size:11.5px; } .reg .rn { color:var(--blue); } .reg .rv { color:var(--num); }
@@ -185,7 +203,7 @@
   .console .chdr .cact:hover { opacity:1; color:#fff; background:#3a3a3a; }
   #copyLog { margin-left:auto; }
   .console .chdr .sec-x { margin-left:6px; }
-  .clog .hit { color:#73c991; } .clog .pause { color:#e2b341; } .clog .info { color:var(--fg-dim); } .clog .cmd { color:var(--name); } .clog .err { color:#f48771; }
+  .clog .hit { color:#73c991; } .clog .pause { color:#e2b341; } .clog .info { color:var(--fg-dim); } .clog .cmd { color:var(--name); } .clog .err { color:#f48771; } .clog .trace { color:#4fc1ff; }
 
   .datatip { position:fixed; z-index:50; background:var(--popup); border:1px solid var(--popup-border); border-radius:5px; box-shadow:0 6px 20px #0007; padding:6px 10px; font-size:12px; display:none; align-items:flex-start; gap:8px; max-width:560px; }
   .datatip.show { display:flex; }
@@ -840,14 +858,56 @@
   function buildBps(list){ bps=list||[];
     const el=$('bpList'); el.innerHTML=''; $('bpCount').textContent=bps.length;
     if(!bps.length){ el.innerHTML='<div class="empty">Set breakpoints in the Clarion editor gutter.</div>'; return; }
-    bps.forEach(b=>{ const d=document.createElement('div'); d.className='bp';
-      d.innerHTML='<span class="chk on"></span><span class="bplink" title="Open in editor">'+esc(b.module)+'</span>:<span class="ln">'+b.line+'</span><span class="rm" title="Remove breakpoint">✕</span>';
+    bps.forEach(b=>{
+      const wrap=document.createElement('div'); wrap.className='bpitem';
+      const d=document.createElement('div'); d.className='bp';
+      // base row: dot + module:line link
+      d.innerHTML='<span class="chk on"></span><span class="bplink" title="Open in editor">'+esc(b.module)+'</span>:<span class="ln">'+b.line+'</span>';
       const lk=d.querySelector('.bplink');
       if(lk) lk.onclick=()=>{ if(b.path) send('openbp', b.line+'\t'+b.path); else if(b.module) send('jump', b.module+':'+b.line); };
-      const rm=d.querySelector('.rm');
-      if(rm) rm.onclick=(e)=>{ e.stopPropagation(); send('bpremove', b.module+':'+(b.requested||b.line)); };
-      el.appendChild(d); });
+      // type styling on the dot + per-type indicator badges (titles via property = injection-safe)
+      const isTrace=!!b.trace, isAdv=!!b.condition||!!b.hitMode;
+      if(isAdv) d.classList.add('has-adv');
+      if(isTrace) d.classList.add('is-trace');
+      if(b.condition) d.appendChild(badge('cond','◆', 'Condition: '+b.condition));
+      if(b.hitMode)   d.appendChild(badge('hits', hitLabel(b.hitMode,b.hitValue), 'Breaks when hit count '+hitLabel(b.hitMode,b.hitValue)));
+      if(isTrace)     d.appendChild(badge('trace','◇', 'Tracepoint (logs, never pauses): '+b.trace));
+      if(b.hitCount>0)d.appendChild(badge('cnt','#'+b.hitCount, 'Hit '+b.hitCount+' time(s)'));
+      // gear (edit properties) + remove
+      const cfg=document.createElement('span'); cfg.className='bpcfg'; cfg.title='Conditions, hit count, tracepoint'; cfg.textContent='⚙';
+      const rm=document.createElement('span'); rm.className='rm'; rm.title='Remove breakpoint'; rm.textContent='✕';
+      rm.onclick=(e)=>{ e.stopPropagation(); send('bpremove', b.module+':'+(b.requested||b.line)); };
+      d.appendChild(cfg); d.appendChild(rm);
+      wrap.appendChild(d);
+      // lazily-built inline editor
+      const ed=buildBpEditor(b); wrap.appendChild(ed);
+      cfg.onclick=(e)=>{ e.stopPropagation(); ed.style.display = ed.style.display==='none' ? 'flex' : 'none'; };
+      el.appendChild(wrap);
+    });
     if(curFile) renderBpDots();
+  }
+  function badge(cls,text,title){ const s=document.createElement('span'); s.className='badge '+cls; s.textContent=text; s.title=title; return s; }
+  function hitLabel(mode,val){ return (mode==='eq'?'= ':mode==='gte'?'≥ ':mode==='mod'?'every ':'')+(val||0)+(mode==='mod'?'th':''); }
+  function buildBpEditor(b){
+    const ed=document.createElement('div'); ed.className='bpedit'; ed.style.display='none';
+    ed.innerHTML=
+      '<label><span>Condition</span><input type="text" class="bp-cond" placeholder="e.g. count > 10" autocomplete="off"></label>'+
+      '<label><span>Hit count</span><select class="bp-hm">'+
+        '<option value="">(any)</option><option value="eq">= N</option><option value="gte">&#8805; N</option><option value="mod">every Nth</option>'+
+      '</select><input type="number" min="1" class="bp-hv" placeholder="N"></label>'+
+      '<label><span>Trace msg</span><input type="text" class="bp-trace" placeholder="e.g. count={count} — logs &amp; continues" autocomplete="off"></label>'+
+      '<div class="acts"><button class="bp-save">Apply</button><button class="bp-cancel">Cancel</button></div>';
+    // prefill via .value (never interpolate user text into HTML)
+    const cond=ed.querySelector('.bp-cond'), hm=ed.querySelector('.bp-hm'), hv=ed.querySelector('.bp-hv'), tr=ed.querySelector('.bp-trace');
+    cond.value=b.condition||''; hm.value=b.hitMode||''; hv.value=b.hitValue||''; tr.value=b.trace||'';
+    ed.querySelector('.bp-cancel').onclick=(e)=>{ e.stopPropagation(); cond.value=b.condition||''; hm.value=b.hitMode||''; hv.value=b.hitValue||''; tr.value=b.trace||''; ed.style.display='none'; };
+    ed.querySelector('.bp-save').onclick=(e)=>{ e.stopPropagation();
+      const mode=hm.value, payload={ module:b.module, line:(b.requested||b.line),
+        condition:cond.value.trim(), hitMode:mode, hitValue:(mode?(parseInt(hv.value,10)||0):0), trace:tr.value.trim() };
+      send('bpprops', JSON.stringify(payload));
+      ed.style.display='none';
+    };
+    return ed;
   }
 
   // ---- procedures (static list from the target EXE; click a file link to open the .clw at the definition) ----
