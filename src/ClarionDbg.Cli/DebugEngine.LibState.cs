@@ -85,6 +85,18 @@ namespace ClarionDbg.Cli
             if (rt == null) { EmitLibStateError(reqId, "RTL not dynamically linked (no ClaRUN.dll) — Library State needs a DLL-runtime build"); return false; }
             if (!haveCtx)   { EmitLibStateError(reqId, "no thread context for func-eval"); return false; }
 
+            // Only call getters when paused at a SAFE point: the thread must be in the user's own Clarion
+            // code (a TSWD image that isn't the runtime), i.e. between RTL calls. If it's paused INSIDE the
+            // runtime/OS (idle in the ACCEPT message pump, mid-syscall, …), hijacking it to call a getter
+            // re-enters the RTL on a thread already inside it and/or clobbers a syscall frame — which raises
+            // the RTL's internal exception and GPFs the app. Refuse cleanly instead.
+            var em = ModuleAt(ctx.Eip);
+            if (em == null || em.Dbg == null || em == rt)
+            {
+                EmitLibStateError(reqId, "can't read here — the thread is inside the runtime/OS, not your code. Pause at a source breakpoint in your own procedure to read Library State.");
+                return false;
+            }
+
             var batch = new List<LibGetter>();
             foreach (var g in LibGetters)
             {
@@ -121,19 +133,35 @@ namespace ClarionDbg.Cli
             Native.SetThreadContext(hThread, ref e);
         }
 
-        /// <summary>A getter call returned (AV at the magic address): record its result (EAX, or EAX deref'd
-        /// as a CSTRING for string getters), then kick the next getter. When the batch drains, restore the
-        /// genuine pause state, emit the `libstate` event, and re-enter the command loop.</summary>
+        /// <summary>A getter call returned cleanly (trap at the magic address): record EAX (numeric) or
+        /// EAX deref'd as a CSTRING (string getters), then advance.</summary>
         private uint OnLibStateEvalComplete(uint tid)
         {
             IntPtr hThread = OpenThreadForContext(tid);
             var c = NewContext();
             bool ok = hThread != IntPtr.Zero && Native.GetThreadContext(hThread, ref c);
-            uint eax = ok ? c.Eax : 0;
+            _libstateRows.Add(LibStateRow(_libstateBatch[_libstateIdx], ok ? c.Eax : 0));
+            return AdvanceLibState(tid, hThread);
+        }
 
-            _libstateRows.Add(LibStateRow(_libstateBatch[_libstateIdx], eax));
+        /// <summary>A getter call FAULTED (RTL internal exception or AV) — mark it unavailable, swallow the
+        /// exception (the AdvanceLibState restore/kick keeps it off the app), and move to the next getter.
+        /// Each getter is attempted from the clean saved context, so one fault doesn't lose the rest.</summary>
+        private uint OnLibStateEvalFault(uint tid, uint exCode, uint exAddr)
+        {
+            var g = _libstateBatch[_libstateIdx];
+            _libstateRows.Add("{\"group\":" + Json.Str(g.Group) + ",\"name\":" + Json.Str(g.Name)
+                + ",\"value\":" + Json.Str("<unavailable>") + ",\"kind\":\"err\"}");
+            if (!EmitJson) Console.WriteLine($"  libstate: {g.Name} ({g.Export}) faulted (code 0x{exCode:X} at 0x{exAddr:X}) — skipped");
+            return AdvanceLibState(tid, OpenThreadForContext(tid));
+        }
+
+        /// <summary>Move to the next getter, or finish the batch: restore the genuine pause state, emit the
+        /// `libstate` event, and re-enter the command loop. Each getter's call starts from a fresh copy of
+        /// the saved context (KickLibStateCall), so this doubles as the post-fault recovery.</summary>
+        private uint AdvanceLibState(uint tid, IntPtr hThread)
+        {
             _libstateIdx++;
-
             if (_libstateIdx < _libstateBatch.Count)
             {
                 KickLibStateCall(hThread, _libstateBatch[_libstateIdx].Va);

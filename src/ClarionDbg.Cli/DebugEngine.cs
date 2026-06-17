@@ -338,6 +338,13 @@ namespace ClarionDbg.Cli
                             // chains the next); a watch is the single THR$GetInstance round-trip.
                             status = _libstateActive ? OnLibStateEvalComplete(tid) : OnEvalComplete(tid);
                         }
+                        else if (_libstateActive && tid == _evalTid)
+                        {
+                            // a Library-State getter FAULTED (the RTL raised its internal exception, or an
+                            // AV) while we were driving it. SWALLOW it — it must never reach the app's
+                            // handler (that GPFs the debuggee) — mark the getter unavailable and move on.
+                            status = OnLibStateEvalFault(tid, exCode, exAddr);
+                        }
                         else
                         {
                             // pass first-chance non-breakpoint exceptions back to the app
