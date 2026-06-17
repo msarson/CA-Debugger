@@ -68,8 +68,22 @@ the existing **DebugView++ fork** (`H:\DevLaptop\DebugViewPP`).
 - Decode the small-offset MEMBER modules (`clbrws.clw`/`001–003`) + the line-region head `[0x624,0x711)`; reconcile Table B. Not on the startup path, so not needed for the engine — revisit for 100% line coverage.
 - Symbol record table + Clarion type codes (Phase 3 watches).
 | 2 — Stepping | Step over/into/out, continue, **EBP-chain call-stack** pane | ✅ done |
-| 3 — Watches | Decode symbol table + Clarion type codes; render locals/globals/buffers/queues in WebView2; hover-eval | |
-| 4 — Polish | Conditional breakpoints, watch expressions, set-next-statement (`SetInstructionPointer`) | |
+| 3 — Watches | Decode symbol table + Clarion type codes; render locals/globals/buffers/queues in WebView2; hover-eval | ✅ done |
+| 4 — Polish | Conditional breakpoints / hit counts / tracepoints ✅, edit values ✅, run-to-cursor + break-on-entry ✅; watch expressions & set-next-statement (`SetInstructionPointer`) pending | partial |
+
+### Recently landed (UI — v1.1.0)
+
+- **Advanced breakpoints** — conditions, hit-count rules, and tracepoints (log an
+  interpolated `{var}` message and keep running), edited from the Breakpoints pane.
+- **Run to cursor** (right-click a line in the debugger Source panel) and
+  **break on procedure entry** (right-click a Procedures-pane row), both reusing
+  the breakpoint engine; run-to-cursor is a self-cleaning one-shot.
+- **Edit variable values** — write a new value into the live process from the
+  Variables tree / Watch.
+- **Procedures pane** (filterable, jumps to the `.clw` definition), **Disassembly**
+  view with instruction-level stepping, per-pane **filter & sort**, and a
+  **DATE/TIME view-as** for `LONG` values.
+- **Rearrangeable two-column layout** with a saved arrangement.
 
 ### Recently landed (engine)
 

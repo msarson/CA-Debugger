@@ -63,7 +63,7 @@
     <p>A modern, source-level debugger for the Clarion IDE — breakpoints in the editor gutter,
        single-stepping, a real call stack with procedure names, and watch-by-name over your
        file buffers and globals.</p>
-    <span class="badge">User Guide · v1.0.1</span>
+    <span class="badge">User Guide · v1.1.0</span>
   </div>
 </header>
 
@@ -83,7 +83,15 @@
       <li><a href="#opening">Opening the pad</a></li>
       <li><a href="#window">The window</a></li>
       <li><a href="#breakpoints">Setting breakpoints</a></li>
+      <li><a href="#advanced-bp">Advanced breakpoints</a></li>
+      <li><a href="#run-to-cursor">Run to cursor</a></li>
+      <li><a href="#break-on-entry">Break on procedure entry</a></li>
+      <li><a href="#procedures">Procedures pane</a></li>
       <li><a href="#inspecting">Inspecting state</a></li>
+      <li><a href="#editing-values">Editing values</a></li>
+      <li><a href="#filter-sort">Filter &amp; sort</a></li>
+      <li><a href="#view-as">View as Date / Time</a></li>
+      <li><a href="#disassembly">Disassembly</a></li>
       <li><a href="#shortcuts">Keyboard shortcuts</a></li>
       <li><a href="#theme">Light / dark theme</a></li>
       <li><a href="#trouble">Troubleshooting</a></li>
@@ -132,26 +140,33 @@
   <h2 id="window">The window</h2>
   <pre>
 ┌───────────────────────────────────────────────────────────────┐
-│ TARGET EXE  [ C:\...\MyApp.exe                    ]  [Browse…] │
-├───────────────────────────────────────────────────────────────┤
 │ ▶Start ▶Continue ⤼Step Over ⤓Step Into ⤒Step Out ■Stop ● idle ⚙◑│
 ├───────────────────────────────────────────────────────────────┤
 │  Status line — where execution is paused                      │
 ├──────────────────────────┬────────────────────────────────────┤
-│ VARIABLES                │  Source view (current line)         │
+│ PROCEDURES               │  Source view (current line)         │
+│ VARIABLES                │                                     │
 │   Tables (file buffers)  │                                     │
 │   Global Variables       │                                     │
 │ WATCH                    │                                     │
-│ CALL STACK               │                                     │
-│ BREAKPOINTS              ├────────────────────────────────────┤
+│ CALL STACK               ├────────────────────────────────────┤
+│ BREAKPOINTS              │  DISASSEMBLY (optional)             │
 │ REGISTERS                │  DEBUG CONSOLE                      │
 └──────────────────────────┴────────────────────────────────────┘</pre>
 
+  <p>The pad is a <strong>rearrangeable two-column workspace</strong>. Sections (Procedures,
+    Variables, Watch, Call Stack, Breakpoints, Registers, and the source / disassembly / console
+    views) can be <strong>dragged to reorder</strong>, moved between the two columns,
+    <strong>hidden</strong>, and either column can be <strong>collapsed</strong> to give the source
+    view more room. Your layout is remembered.</p>
+
   <h3>Target EXE</h3>
   <ul>
-    <li>The field <strong>auto-resolves</strong> from the active IDE project (it reads the project's
-      output type/name), so usually it's already filled in.</li>
-    <li>Otherwise click <strong>Browse…</strong> and pick the <code>.exe</code> (built with Full debug info).</li>
+    <li>The target EXE <strong>auto-resolves</strong> from the active IDE project / toolbar (it reads
+      the project's output type/name), so usually it's already set — there's no longer a Target EXE
+      field to fill in by hand.</li>
+    <li>If the project can't be resolved, the debugger reports it on Start; make sure the project is
+      open/active and built with Full debug info.</li>
   </ul>
 
   <h3>Toolbar &amp; run states</h3>
@@ -162,6 +177,8 @@
     <tr><td><strong>Step Over</strong></td><td>Execute the current line, stepping over procedure calls</td></tr>
     <tr><td><strong>Step Into</strong></td><td>Execute the current line, stepping into a procedure call</td></tr>
     <tr><td><strong>Step Out</strong></td><td>Run until the current procedure returns to its caller</td></tr>
+    <tr><td><strong>Step Instr</strong></td><td>Step one x86 instruction, into calls (drives the Disassembly view)</td></tr>
+    <tr><td><strong>Step Instr Over</strong> / <strong>Next Instr</strong></td><td>Step one x86 instruction, over calls (drives the Disassembly view)</td></tr>
     <tr><td><strong>Stop</strong></td><td>Terminate the debug session and the target process</td></tr>
   </table>
   <p>The status dot shows <span class="pill" style="background:#888"></span><strong>idle</strong>,
@@ -174,6 +191,39 @@
     line in a generated <code>.clw</code>. CA Debugger listens for gutter changes and lists every
     breakpoint in the <strong>Breakpoints</strong> pane (<code>file : line</code>). When the debuggee
     hits one, execution pauses and the source view jumps to and highlights the current line.</p>
+
+  <h3 id="advanced-bp">Advanced breakpoints</h3>
+  <p>Any breakpoint can do more than just stop. Open a breakpoint's properties editor from the
+    <strong>Breakpoints</strong> pane (the gear <strong>⚙</strong> on a breakpoint row) and give it:</p>
+  <ul>
+    <li><strong>A condition</strong> — break only when an expression is true (a simple comparison of a
+      variable, e.g. <code>CUS:ID = 42</code>). The line runs past untouched until the condition holds.</li>
+    <li><strong>A hit-count rule</strong> — break on the <em>N</em>th hit, on <em>every</em> <em>N</em>th
+      hit, or once hits are <em>≥ N</em>.</li>
+    <li><strong>Tracepoint</strong> — instead of pausing, log an interpolated message and keep running.
+      The message can embed values with <code>{variable}</code> tokens (e.g.
+      <code>Order {ORD:ID} total {ORD:TOTAL}</code>). A tracepoint <em>never</em> pauses execution.</li>
+  </ul>
+  <div class="tip">Conditions and tracepoints use simple variable comparisons / interpolation — they're
+    not a full expression language. Keep them to a variable and a value.</div>
+
+  <h3 id="run-to-cursor">Run to cursor</h3>
+  <p>While paused, right-click a line in the debugger's <strong>Source panel</strong> and choose
+    <strong>▶ Run to cursor</strong> to resume and stop at that line. It uses a one-shot breakpoint that
+    removes itself automatically, so nothing is left behind in the Breakpoints pane.</p>
+  <div class="tip">This lives in the debugger pad's own Source panel — it is not (yet) on the Monaco code
+    editor's right-click menu.</div>
+
+  <h3 id="break-on-entry">Break on procedure entry</h3>
+  <p>Right-click a row in the <strong>Procedures</strong> pane and choose <strong>⛔ Break on entry</strong>
+    to set a breakpoint at that procedure's definition line — handy when you know <em>which</em> procedure
+    you want to stop in but not the exact line.</p>
+
+  <h2 id="procedures">Procedures</h2>
+  <p>The <strong>Procedures</strong> pane lists every procedure and method in the target — a filterable,
+    clickable index. <strong>Click a row</strong> to jump the source to that procedure's <code>.clw</code>
+    definition, or <strong>right-click</strong> for <strong>⛔ Break on entry</strong> (above). The filter
+    box at the top narrows the list as you type.</p>
 
   <h2 id="inspecting">Inspecting state (while paused)</h2>
 
@@ -214,6 +264,28 @@
   <h3>Debug Console</h3>
   <p>A running log of session events — breakpoint hits, pauses, commands, and errors.</p>
 
+  <h3 id="editing-values">Editing values</h3>
+  <p>While paused you can write a new value into a variable. Click into a variable's <strong>value
+    cell</strong> — in the Variables tree or on a Watch row — type a new value, and commit
+    (<kbd>Enter</kbd>). The value is written straight into the live process. The write respects the
+    variable's <strong>type and size</strong>, so values are stored in the variable's native format.</p>
+
+  <h3 id="filter-sort">Filter &amp; sort</h3>
+  <p>The <strong>Variables</strong> and <strong>Call Stack</strong> panes each have a per-pane
+    <strong>filter box</strong> to narrow the rows, plus a <strong>name-sort toggle</strong> to order
+    entries by name.</p>
+
+  <h3 id="view-as">View as Date / Time</h3>
+  <p>A Clarion <code>LONG</code> holding a Clarion Standard Date or Time can be shown
+    <strong>formatted</strong> as a date or a time instead of the raw number — a per-value
+    <em>view as</em> option on the row. Handy for date/time fields that otherwise read as a bare integer.</p>
+
+  <h3 id="disassembly">Disassembly</h3>
+  <p>A gated <strong>x86 disassembly</strong> view of the current location, for instruction-level
+    debugging. Use the instruction-step toolbar actions — <strong>Step Instr</strong> and
+    <strong>Step Instr Over</strong> / <strong>Next Instr</strong> — to advance one machine instruction
+    at a time.</p>
+
   <h2 id="shortcuts">Keyboard shortcuts</h2>
   <div class="warn">
     Debug commands ship <strong>unbound by default</strong>. The Clarion IDE claims
@@ -241,8 +313,8 @@
         <td>Rebuild the target with <strong>Full</strong> debug information (not partial/none).</td></tr>
     <tr><td><kbd>F5</kbd> / <kbd>F10</kbd> / <kbd>F11</kbd> do nothing</td>
         <td>Expected — the IDE owns those keys. Bind your own shortcuts in <strong>Settings (⚙)</strong>.</td></tr>
-    <tr><td>Target EXE field is blank</td>
-        <td>Open/activate the project, or pick the EXE with <strong>Browse…</strong>.</td></tr>
+    <tr><td>Target EXE can't be resolved on Start</td>
+        <td>Open/activate the project so the debugger can read its output EXE from the IDE.</td></tr>
     <tr><td>No source shown on a hit</td>
         <td>The generated <code>.clw</code> is resolved via the project's <code>.red</code> redirect;
             make sure the source still exists where the redirect points.</td></tr>

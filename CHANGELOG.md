@@ -3,6 +3,68 @@
 All notable changes to CA Debugger are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## v1.1.0 — 2026-06-16
+
+A large feature release focused on the debugging experience — richer breakpoints,
+live value editing, faster navigation, and a more flexible layout — on top of the
+same proven 32-bit engine + WebView2 front-end.
+
+### Added
+
+- **Advanced breakpoints** — give any breakpoint a **condition** (break only when
+  an expression is true), a **hit-count rule** (break on the Nth hit, every Nth, or
+  when hits ≥ N), or turn it into a **tracepoint** (log an interpolated `{var}`
+  message and keep running — never pauses). Edited from the Breakpoints pane.
+- **Run to cursor** — while paused, right-click a line in the debugger's Source
+  panel to resume and stop there. It plants a one-shot breakpoint that removes
+  itself automatically and leaves nothing behind in the Breakpoints pane.
+- **Break on procedure entry** — right-click a row in the new Procedures pane to
+  drop a breakpoint at that procedure's definition line.
+- **Edit variable values** — type a new value into a variable's value cell (in the
+  Variables tree or Watch) to write it into the live process.
+- **Procedures pane** — a filterable, clickable list of every procedure/method in
+  the target; click to jump to its `.clw` definition.
+- **Disassembly view** — a gated x86 disassembly of the current location, with
+  **instruction-level stepping** (step one instruction, into or over calls).
+- **Filter & sort** — per-pane filter boxes and a name sort on the Variables and
+  Call Stack panes.
+- **DATE / TIME view-as** — render a Clarion `LONG` holding a Standard Date or Time
+  as a formatted date/time instead of the raw number.
+- **Variables tree overhaul** — call-stack-frame-scoped locals (frame-aware
+  Procedure Data / Method Data), array elements, and lazy on-demand expansion of
+  by-reference structures (GROUP / CLASS / QUEUE), plus module-scope data.
+- **Rearrangeable layout** — a two-column workspace; drag to reorder, collapse, or
+  hide sections, with your arrangement remembered.
+- **Pause / break-into** a running target, and **multi-DLL** debugging —
+  breakpoints, hits, and stack frames resolve correctly across DLL boundaries.
+- **Debug Console** copy / clear actions.
+
+### Changed
+
+- Pause/step navigation is **Monaco-aware** — when the ClarionAssistant Monaco
+  overlay is active, the editor scrolls to and highlights the current line.
+- Call stack is walked via the **EBP chain** (with at-entry caller and
+  monotonic-frame guards), replacing the older over-inclusive stack scan.
+
+### Fixed
+
+- **Step Over** no longer skips a line that immediately follows a procedure call.
+- Breakpoint and call-stack clicks navigate reliably to the target line (including
+  under the Monaco overlay).
+- Removing one of several gutter lines that snapped to the same code line no longer
+  leaves the shared breakpoint planted and firing (ref-counted INT3).
+
+### Requirements
+
+- Clarion 10, 11, or 12 (32-bit).
+- Microsoft Edge WebView2 Runtime (for the debugger pad UI).
+- The target application must be compiled with **Full** debug information.
+
+### Install
+
+Download `CA-Debugger-1.1.0-Setup.exe` from the release assets and run it (close
+the Clarion IDE first). See the [User Guide](https://htmlpreview.github.io/?https://github.com/ClarionLive/CA-Debugger/blob/main/docs/user-guide.html) for usage.
+
 ## v1.0.1 — 2026-06-10
 
 First public release of CA Debugger — a modern, source-level debugger addin for

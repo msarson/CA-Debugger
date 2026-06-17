@@ -7,7 +7,7 @@
 ; the staging\ folders have already been populated.
 
 #define MyAppName "CA Debugger"
-#define MyAppVersion "1.0.1"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "ClarionLive"
 #define MyAppURL "https://github.com/ClarionLive/CA-Debugger"
 
