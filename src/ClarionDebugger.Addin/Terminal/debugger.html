@@ -105,6 +105,8 @@
   .ctxmenu.show { display:block; }
   .ctxmenu .mi { padding:6px 14px; cursor:pointer; display:flex; align-items:center; gap:9px; }
   .ctxmenu .mi:hover { background:var(--accent); color:#fff; }
+  .ctxmenu .mi.disabled { opacity:.4; cursor:default; }
+  .ctxmenu .mi.disabled:hover { background:none; color:inherit; }
   .row .ar { width:12px; color:var(--fg-dim); font-size:10px; cursor:pointer; }
   .row.lvl1 { padding-left:30px; } .row.lvl2 { padding-left:46px; }
   .vname { color:var(--name); } .vname.field { color:var(--fg); }
@@ -335,6 +337,8 @@
     <span class="dacts"><span class="dact" id="dtPin" title="Add to Watch"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg></span><span class="dact copy" id="dtCopy" title="Copy Value">⧉</span></span>
   </div>
   <div class="ctxmenu" id="treeMenu"><div class="mi" id="tmWatch">👁 Add to Watch</div></div>
+  <div class="ctxmenu" id="srcMenu"><div class="mi" id="miRtc">▶ Run to cursor</div></div>
+  <div class="ctxmenu" id="procMenu"><div class="mi" id="miBpEntry">⛔ Break on entry</div></div>
 
   <div class="modal-backdrop" id="settingsBackdrop">
     <div class="modal" role="dialog" aria-label="Settings">
@@ -664,7 +668,35 @@
       const tm=$('treeMenu'); tm.style.left=Math.min(e.clientX,window.innerWidth-200)+'px'; tm.style.top=e.clientY+'px'; tm.classList.add('show'); });
   }
   $('tmWatch').onclick=()=>{ addWatchMany(Array.from(selSet).map(r=>r.dataset.name).filter(Boolean)); $('treeMenu').classList.remove('show'); selSet.clear(); applySel(); };
-  document.addEventListener('click',()=>$('treeMenu').classList.remove('show'));
+  document.addEventListener('click',()=>{ $('treeMenu').classList.remove('show'); $('srcMenu').classList.remove('show'); $('procMenu').classList.remove('show'); });
+
+  // ---- Source view: right-click "Run to cursor" (one-shot bp at the line, then resume). Only meaningful
+  // while paused; the item is shown disabled otherwise. Delegated so it survives buildSource() rebuilds. ----
+  let rtcLine=null;
+  $('src').addEventListener('contextmenu',e=>{
+    const sl=e.target.closest('.sline'); if(!sl||!curFile) return;
+    e.preventDefault();
+    rtcLine=parseInt(sl.dataset.line,10);
+    $('miRtc').classList.toggle('disabled', !paused);
+    const m=$('srcMenu'); m.style.left=Math.min(e.clientX,window.innerWidth-200)+'px'; m.style.top=e.clientY+'px'; m.classList.add('show');
+  });
+  $('miRtc').onclick=()=>{ $('srcMenu').classList.remove('show');
+    if(!paused||rtcLine==null||isNaN(rtcLine)||!curFile) return;
+    send('runtocursor', curFile+':'+rtcLine); };
+
+  // ---- Procedures pane: right-click "Break on entry" (persistent bp at the procedure's definition line).
+  // Works in any state (idle stages it; running/paused plants it live). Delegated for buildProcs() rebuilds. ----
+  let procCtx=null;
+  $('procList').addEventListener('contextmenu',e=>{
+    const row=e.target.closest('.proc'); if(!row) return;
+    e.preventDefault();
+    procCtx={ name:row.dataset.name||'', module:row.dataset.module||'', line:parseInt(row.dataset.line||'0',10) };
+    const m=$('procMenu'); m.style.left=Math.min(e.clientX,window.innerWidth-200)+'px'; m.style.top=e.clientY+'px'; m.classList.add('show');
+  });
+  $('miBpEntry').onclick=()=>{ $('procMenu').classList.remove('show');
+    if(!procCtx||!procCtx.module||!procCtx.line||isNaN(procCtx.line)) return;
+    // module+line FIRST so the host's minimal JSON parser reads them before the (untrusted) proc name
+    send('breakonprocentry', JSON.stringify({ module:procCtx.module, line:procCtx.line, name:procCtx.name })); };
   function removeWatch(name){ if(watched.delete(name)){ renderWatchList(); send('unwatch',name); } }
 
   function renderWatchList(){
@@ -1085,6 +1117,8 @@
     // so interpolating them into an HTML attribute would be an injection sink).
     allProcs.forEach(p=>{ const module=p.module||'', name=p.name||'';
       const d=document.createElement('div'); d.className='proc'; d.dataset.key=name.toLowerCase();
+      // module/line/name for the right-click "Break on entry" action (dataset assignment is injection-safe)
+      d.dataset.module=module; d.dataset.line=p.line; d.dataset.name=name;
       const nm=document.createElement('span'); nm.className='procname'; nm.textContent=name;
       const fl=document.createElement('span'); fl.className='procfile'; fl.textContent=module;
       fl.title='Open '+module+' at line '+p.line;

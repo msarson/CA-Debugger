@@ -31,6 +31,16 @@ namespace ClarionDebugger.Terminal
         private readonly ClarionDebuggerService _svc = new ClarionDebuggerService();
         private readonly EditorBreakpointService _gutter = new EditorBreakpointService();
         private readonly List<DebugBreakpoint> _pending = new List<DebugBreakpoint>(); // breakpoints while idle
+        // Transient "run to cursor" breakpoints — planted in the engine then auto-removed on the next pause
+        // (whether the cursor line or another breakpoint is hit first). Kept OUT of _pending and the gutter so
+        // they never persist or show in the Breakpoints pane. Keyed "module:line" (module compared case-insensitively).
+        private readonly HashSet<string> _transientBps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // The one run-to-cursor transient awaiting engine bp-set confirmation before we resume (two-phase, so a
+        // transient the engine rejects via async bp-error never leaves the target running with no stop). Null
+        // when no run-to-cursor is in flight. Its key is also in _transientBps, so cleanup happens regardless of
+        // whether confirmation ever arrives. UI-thread only.
+        private string _pendingRtcKey;
+        private int _pendingRtcLine;   // requested line of the pending run-to-cursor — matches the engine's bp echo by line
         private readonly HashSet<string> _watched = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private string _exe = "";
         private bool _exeAuto;          // _exe came from auto-resolve (re-resolvable)
@@ -142,16 +152,49 @@ namespace ClarionDebugger.Terminal
                 + ",\"value\":" + Str(value) + ",\"error\":" + Str(error) + "}");
             if (!ok) Console("err", "edit value failed: " + (error ?? "unknown"));
         });
-        private void OnSvcBreakpointSet(DebugBreakpoint bp) => UI(() => SendBps());
+        private void OnSvcBreakpointSet(DebugBreakpoint bp) => UI(() =>
+        {
+            // Phase 2 of run-to-cursor: the transient is now confirmed armed, so it's safe to resume. There is
+            // at most one pending run-to-cursor, just planted while paused on a line that had NO breakpoint
+            // before, so the bp-set at that requested/planted line is unambiguously ours — match by LINE, not
+            // module. Then ADOPT the engine's CANONICAL module+line as the transient's tracking key, so the
+            // later RemoveBreakpoint (OnPaused) matches engine truth even if the engine canonicalizes the module
+            // name differently from the UI's curFile — no stranded, untracked one-shot.
+            if (_pendingRtcKey != null && bp != null && bp.Module != null
+                && (bp.RequestedLine == _pendingRtcLine || bp.Line == _pendingRtcLine))
+            {
+                _transientBps.Remove(_pendingRtcKey);
+                _pendingRtcKey = null;
+                _transientBps.Add(TransientKey(bp.Module, bp.RequestedLine));   // engine-confirmed identity
+                SendBps();
+                if (CurrentState == DebugSessionState.Paused) _svc.Continue();
+                return;
+            }
+            SendBps();
+        });
         private void OnSvcBreakpointRemoved(string m, int l) => UI(() => SendBps());
         private void OnSvcBreakpointList(List<DebugBreakpoint> list) => UI(() => SendBps());
-        private void OnSvcBreakpointError(string m, int l, string err) => UI(() => Console("err", "breakpoint " + m + ":" + l + " — " + err));
+        private void OnSvcBreakpointError(string m, int l, string err) => UI(() =>
+        {
+            // A pending run-to-cursor transient the engine rejected (e.g. no resolvable code record): it never
+            // armed, so drop it and stay paused rather than running free with no stop. Match by line for the
+            // same reason as bp-set (one pending RTC; module spelling may be the engine's canonical form).
+            if (_pendingRtcKey != null && l == _pendingRtcLine)
+            {
+                _transientBps.Remove(_pendingRtcKey);
+                _pendingRtcKey = null;
+                Console("err", "run to cursor: " + m + ":" + l + " — " + err + " (could not arm; staying paused).");
+                SendBps();
+                return;
+            }
+            Console("err", "breakpoint " + m + ":" + l + " — " + err);
+        });
         private void OnSvcTraced(string m, int l, string msg, int hits) => UI(() => Console("trace", m + ":" + l + "  " + msg + "  (#" + hits + ")"));
         private void OnSvcEngineError(string msg) => UI(() => Console("err", "engine: " + msg));
         private void OnSvcModuleLoaded(DebugModule m) => UI(() => OnModuleLoaded(m));
         private void OnSvcModuleUnloaded(DebugModule m) => UI(() => Post("{\"type\":\"module-unloaded\",\"name\":" + Str(m.Name) + "}"));
         private void OnSvcLog(string s) => UI(() => Console("info", s));
-        private void OnSvcExited(int code) => UI(() => { ClearCurrentLineMarker(); Console("info", "— session ended (exit " + code + ") —"); Post("{\"type\":\"clear\"}"); });
+        private void OnSvcExited(int code) => UI(() => { _transientBps.Clear(); _pendingRtcKey = null; ClearCurrentLineMarker(); Console("info", "— session ended (exit " + code + ") —"); Post("{\"type\":\"clear\"}"); });
 
         private void OnGutterAdded(string m, int l, string f) => UI(() => OnGutterBpAdded(m, l));
         private void OnGutterRemoved(string m, int l, string f) => UI(() => OnGutterBpRemoved(m, l));
@@ -333,6 +376,8 @@ namespace ClarionDebugger.Terminal
                     case "openbp": OpenBp(data); break;
                     case "bpremove": RemoveBp(data); break;
                     case "bpprops": SetBpProps(data); break;
+                    case "runtocursor": CmdRunToCursor(data); break;   // transient one-shot bp at module:line, then resume
+                    case "breakonprocentry": CmdBreakOnProcEntry(data); break;   // persistent bp at a procedure's entry line
                     case "proclist":   // user pressed ↻ — re-resolve FRESH so the list tracks a project/solution switch
                         TryAutoResolveExe();   // (re-resolves against the active project even if _exe was already set)
                         if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);
@@ -387,6 +432,94 @@ namespace ClarionDebugger.Terminal
         public void CmdStepOver() { if (CurrentState == DebugSessionState.Paused) _svc.StepOver(); }
         public void CmdStepInto() { if (CurrentState == DebugSessionState.Paused) _svc.StepInto(); }
         public void CmdStepOut()  { if (CurrentState == DebugSessionState.Paused) _svc.StepOut(); }
+
+        /// <summary>Run to cursor: plant a transient one-shot breakpoint at module:line and resume. The bp is
+        /// tracked in <see cref="_transientBps"/> (NOT _pending / the gutter), filtered out of the Breakpoints
+        /// pane by <see cref="SendBps"/>, and removed on the next pause (<see cref="OnPaused"/>) — so it fires
+        /// once and is cancelled whether the cursor line or another breakpoint is hit first. Only valid while
+        /// paused (the Source view, and hence a cursor, exists only then). Data is "module:line". Behaviour when
+        /// a breakpoint already sits on the SAME REQUESTED line: an unconditional one will stop anyway (just
+        /// continue); a conditional/hit-count/tracepoint one may NOT stop, so we defer to it with a warning
+        /// rather than planting a clobbering duplicate. We only resume if the transient actually armed.</summary>
+        public void CmdRunToCursor(string spec)
+        {
+            if (CurrentState != DebugSessionState.Paused || string.IsNullOrEmpty(spec)) return;
+            int c = spec.LastIndexOf(':');
+            if (c <= 0) return;
+            string module = spec.Substring(0, c);
+            int line;
+            if (!int.TryParse(spec.Substring(c + 1), out line)) return;
+
+            // A persistent breakpoint on the SAME REQUESTED line is the only conflict: the engine collapses a
+            // re-add at an identical requested line into a props-update (and removal is by requested line), so
+            // planting a transient there would clobber — then delete — the user's breakpoint. (A transient that
+            // merely SNAPS onto another bp's planted address is safe: it gets its own logical bp and the shared
+            // INT3 is ref-counted.) So branch only on an exact requested-line match:
+            //   • unconditional bp already there → it will stop anyway; just continue, don't plant.
+            //   • conditional / hit-count / tracepoint bp there → it may NOT stop, but we can't plant a separate
+            //     transient without clobbering it. Defer to it and warn, rather than silently failing to stop.
+            //   • nothing on this requested line → plant the transient one-shot and continue.
+            DebugBreakpoint exact = null;
+            foreach (var b in _svc.Breakpoints)
+                if (string.Equals(b.Module, module, StringComparison.OrdinalIgnoreCase) && b.RequestedLine == line) { exact = b; break; }
+
+            if (exact != null)
+            {
+                bool advanced = !string.IsNullOrEmpty(exact.Condition) || !string.IsNullOrEmpty(exact.HitMode) || !string.IsNullOrEmpty(exact.Trace);
+                if (advanced)
+                    Console("info", "run to cursor: a conditional/hit-count/tracepoint breakpoint already sits on "
+                        + module + ":" + line + " — resuming; execution stops there only if that breakpoint's rule is met.");
+                else
+                    Console("info", "run to cursor: " + module + ":" + line + " (breakpoint already set here)");
+                _svc.Continue();   // an existing bp already covers this line — nothing to arm, resume now
+                return;
+            }
+
+            // No breakpoint on this requested line — plant a transient one-shot. TWO-PHASE: arm first, then
+            // resume only once the engine CONFIRMS it armed (bp-set). A true AddBreakpoint return is just a
+            // successful stdin write; the engine can still reject the line ASYNCHRONOUSLY via bp-error (e.g. no
+            // resolvable code record), and resuming before confirmation would run the target free with no stop —
+            // a "ran to cursor" that silently didn't. So: track the key now (filtered from the pane immediately,
+            // and always cleaned up on pause/exit even if confirmation never comes), then defer Continue() to
+            // OnSvcBreakpointSet; OnSvcBreakpointError aborts and stays paused.
+            if (!_svc.AddBreakpoint(module, line))
+            {
+                Console("err", "run to cursor: could not set a breakpoint at " + module + ":" + line + " — staying paused.");
+                return;
+            }
+            string rtcKey = TransientKey(module, line);
+            _transientBps.Add(rtcKey);
+            _pendingRtcKey = rtcKey;    // resume happens in OnSvcBreakpointSet once the engine confirms this bp
+            _pendingRtcLine = line;     // match the engine echo by line (module spelling is re-adopted from it)
+            Console("info", "run to cursor: " + module + ":" + line);
+        }
+
+        private static string TransientKey(string module, int line) { return (module ?? "") + ":" + line; }
+
+        /// <summary>Break on procedure entry: plant a normal (persistent) breakpoint at a procedure's
+        /// definition line, surfaced from a right-click on a Procedures-pane row. Data is a JSON object
+        /// {name, module, line} — the row already carries module+line, so no re-resolution is needed. Running
+        /// or paused → push straight to the engine; idle → stage in _pending (deduped), exactly like a gutter
+        /// breakpoint. Deliberately does NOT touch the IDE gutter (no red dot), matching how _pending bps work.</summary>
+        public void CmdBreakOnProcEntry(string data)
+        {
+            if (string.IsNullOrEmpty(data)) return;
+            string module = JsonVal(data, "module");
+            if (string.IsNullOrEmpty(module)) return;
+            int line;
+            if (!int.TryParse(JsonVal(data, "line") ?? "", out line) || line <= 0) return;
+            string name = JsonVal(data, "name");
+
+            Console("info", "break on entry: " + (string.IsNullOrEmpty(name) ? "" : name + "  ") + module + ":" + line);
+
+            if (_svc.IsRunning) _svc.AddBreakpoint(module, line);   // engine echoes bp-set → pane refresh
+            else
+            {
+                foreach (var b in _pending) if (SameBp(b, module, line)) return;   // already staged
+                _pending.Add(new DebugBreakpoint { Module = module, RequestedLine = line, Line = line });
+                SendBps();
+            }
+        }
 
         public void CmdPause()
         {
@@ -661,6 +794,29 @@ namespace ClarionDebugger.Terminal
                 // a 'watch' pause is the func-eval round-trip completing — NOT a fresh stop; don't cascade
                 if (string.Equals(p.Reason, "watch", StringComparison.OrdinalIgnoreCase)) return;
 
+                // Cancel any "run to cursor" transient breakpoints — execution has genuinely stopped (at the
+                // cursor line, or at a real breakpoint reached first), so the one-shot has served its purpose.
+                // Remove from the engine and clear the set; the bp-del echo refreshes the pane.
+                if (_transientBps.Count > 0)
+                {
+                    foreach (var key in new List<string>(_transientBps))
+                    {
+                        int ci = key.LastIndexOf(':');
+                        if (ci <= 0) continue;
+                        int tl;
+                        if (!int.TryParse(key.Substring(ci + 1), out tl)) continue;
+                        _svc.RemoveBreakpoint(key.Substring(0, ci), tl);
+                    }
+                    _transientBps.Clear();
+                    _pendingRtcKey = null;   // defensive: any in-flight run-to-cursor is now moot (we've stopped)
+                    // Resync the pane from engine truth. A transient can snap onto the SAME planted address as a
+                    // real breakpoint at a different requested line; the engine ref-counts the INT3 and keeps the
+                    // real bp armed, but its bp-del echo carries only the planted line, and the host bp mirror
+                    // (keyed by planted line) would then drop the surviving real bp's row. A bp-list refresh
+                    // rebuilds the mirror from the engine, so the real breakpoint stays visible.
+                    _svc.RequestBreakpointList();
+                }
+
                 var sb = new StringBuilder();
                 sb.Append("{\"type\":\"paused\",\"module\":").Append(Str(p.Module))
                   .Append(",\"proc\":").Append(Str(p.Proc))
@@ -743,7 +899,15 @@ namespace ClarionDebugger.Terminal
         private void SendBps()
         {
             var sb = new StringBuilder("{\"type\":\"bplist\",\"bps\":[");
-            var list = new List<DebugBreakpoint>(_svc.IsRunning ? _svc.Breakpoints : _pending.ToArray());
+            // Transient "run to cursor" breakpoints live in the engine list while armed; never surface them in
+            // the pane (they're one-shot and removed on the next pause).
+            var list = new List<DebugBreakpoint>();
+            foreach (var b in (_svc.IsRunning ? _svc.Breakpoints : _pending.ToArray()))
+            {
+                if (b.Module != null && (_transientBps.Contains(TransientKey(b.Module, b.Line))
+                                      || _transientBps.Contains(TransientKey(b.Module, b.RequestedLine)))) continue;
+                list.Add(b);
+            }
 
             // The engine's bp list carries no source path; the IDE gutter is the source of truth for
             // the .clw file. Build a (module|line) -> path map from the gutter so each row can carry
