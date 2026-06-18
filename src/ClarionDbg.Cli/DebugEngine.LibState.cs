@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Text;
 using ClarionDbg.Core;
 
 namespace ClarionDbg.Cli
@@ -9,60 +8,61 @@ namespace ClarionDbg.Cli
     {
         // ------------------------------------------------------------ Library State (per-thread RTL state)
         //
-        // The legacy Clarion debugger's "Library State" window: per-thread RTL values (ERROR/EVENT/FIELD/…)
-        // read by CALLING the matching ClaRUN.dll getter export (Cla$ERRORCODE, Cla$EVENT, …) ON the paused
-        // thread — so each value is automatically that thread's. We resolve each export's address from the
-        // runtime DLL's export table, then func-eval the whole batch: hijack the thread to call getter[0],
-        // trap its return at the magic address, record EAX, call getter[1], … and when the batch drains,
-        // restore the genuine pause state and emit one `libstate` event. Reuses the THR$GetInstance eval
-        // machinery (EVAL_TRAP_VA + the saved-context restore), extended to a sequential queue.
+        // The legacy Clarion debugger's "Library State" window: per-thread RTL values (ERROR/EVENT/FIELD/…).
+        //
+        // We read each value by EMULATING the matching ClaRUN.dll getter export (Cla$ERRORCODE, Cla$EVENT, …)
+        // with a READ-ONLY x86 emulator (RtlEmulator) — we do NOT call the getter on the stopped thread.
+        // Calling re-enters the RTL's per-thread machinery; when the thread is parked inside the ACCEPT/
+        // TakeEvent loop (exactly when EVENT/FIELD/FOCUS are interesting) the RTL detects the re-entrancy and
+        // raises its internal fatal 0x6BEF5E4C on the next resume, killing the debuggee. The emulator runs the
+        // getter's real code but every debuggee access is a ReadProcessMemory, writes go to a copy-on-write
+        // shadow (the target is never modified), and the imports that matter are intrinsics (TlsGetValue ->
+        // TEB.TlsSlots, GetCurrentThreadId -> stopped tid, …). No hijack, no func-eval, no re-entrancy — safe
+        // to read while parked ANYWHERE, including mid-TakeEvent. It's synchronous (just memory reads), so —
+        // unlike the old getter-calling path — it answers inline without leaving the pause loop.
 
-        private enum LibKind { Num, UNum, Str }
+        private enum LibKind { Signed, Unsigned, Str, Date, Time }
 
         private sealed class LibGetter
         {
-            public string Group;    // panel section: Error | Event | Other
-            public string Name;     // display name (ERRORCODE)
-            public string Export;   // ClaRUN export to call (Cla$ERRORCODE)
-            public LibKind Kind;    // how to read the return: signed/unsigned EAX, or EAX as a char*
-            public uint Va;         // resolved live VA (filled per-request)
+            public LibGetter(string group, string name, string export, LibKind kind)
+            { Group = group; Name = name; Export = export; Kind = kind; }
+            public readonly string Group;    // panel section: Error | Event | Other
+            public readonly string Name;     // display name (ERRORCODE)
+            public readonly string Export;   // ClaRUN export whose body we emulate (Cla$ERRORCODE)
+            public readonly LibKind Kind;    // how to interpret the result
         }
 
-        // v1 getter set: Carl Barnes' Error + Event groups + the "suggest new" extras. Side-effect-free
-        // getters only (LONGPATH clears the error code, CLIPBOARD locks the clipboard — both excluded).
+        // The getter set. Deliberately excludes the side-effecting exports: Cla$LONGPATH/Cla$SHORTPATH clear
+        // the error code, Cla$CLIPBOARD locks the clipboard. FILEERRORCODE returns a string here
+        // (Cla$FILEERRORCODE) per the runtime's own ABI. TODAY/CLOCK don't read thread state, so they're
+        // computed from the host clock (same machine as the debuggee) rather than emulated.
         private static readonly LibGetter[] LibGetters =
         {
-            new LibGetter{Group="Error", Name="ERRORCODE",     Export="Cla$ERRORCODE",     Kind=LibKind.Num},
-            new LibGetter{Group="Error", Name="ERROR",         Export="Cla$StackErrstr",   Kind=LibKind.Str},
-            new LibGetter{Group="Error", Name="ERRORFILE",     Export="Cla$ERRORFILE",     Kind=LibKind.Str},
-            new LibGetter{Group="Error", Name="FILEERRORCODE", Export="Cla$FILEERRORCODE", Kind=LibKind.Str},
-            new LibGetter{Group="Error", Name="FILEERROR",     Export="Cla$FILEERRORMSG",  Kind=LibKind.Str},
+            new LibGetter("Error", "ERRORCODE",     "Cla$ERRORCODE",     LibKind.Signed),
+            new LibGetter("Error", "ERROR",         "Cla$StackErrstr",   LibKind.Str),
+            new LibGetter("Error", "ERRORFILE",     "Cla$ERRORFILE",     LibKind.Str),
+            new LibGetter("Error", "FILEERRORCODE", "Cla$FILEERRORCODE", LibKind.Str),
+            new LibGetter("Error", "FILEERROR",     "Cla$FILEERRORMSG",  LibKind.Str),
 
-            new LibGetter{Group="Event", Name="EVENT",      Export="Cla$EVENT",      Kind=LibKind.Num},
-            new LibGetter{Group="Event", Name="ACCEPTED",   Export="Cla$ACCEPTED",   Kind=LibKind.Num},
-            new LibGetter{Group="Event", Name="FIELD",      Export="Cla$FIELD",      Kind=LibKind.Num},
-            new LibGetter{Group="Event", Name="FOCUS",      Export="Cla$FOCUS",      Kind=LibKind.Num},
-            new LibGetter{Group="Event", Name="FIRSTFIELD", Export="Cla$FIRSTFIELD", Kind=LibKind.Num},
-            new LibGetter{Group="Event", Name="LASTFIELD",  Export="Cla$LASTFIELD",  Kind=LibKind.Num},
-            new LibGetter{Group="Event", Name="KEYCODE",    Export="Cla$KEYCODE",    Kind=LibKind.Num},
-            new LibGetter{Group="Event", Name="THREAD",     Export="Cla$THREAD",     Kind=LibKind.Num},
+            new LibGetter("Event", "EVENT",      "Cla$EVENT",      LibKind.Signed),
+            new LibGetter("Event", "ACCEPTED",   "Cla$ACCEPTED",   LibKind.Signed),
+            new LibGetter("Event", "FIELD",      "Cla$FIELD",      LibKind.Signed),
+            new LibGetter("Event", "FOCUS",      "Cla$FOCUS",      LibKind.Signed),
+            new LibGetter("Event", "FIRSTFIELD", "Cla$FIRSTFIELD", LibKind.Signed),
+            new LibGetter("Event", "LASTFIELD",  "Cla$LASTFIELD",  LibKind.Signed),
+            new LibGetter("Event", "KEYCODE",    "Cla$KEYCODE",    LibKind.Signed),
+            new LibGetter("Event", "THREAD",     "Cla$THREAD",     LibKind.Signed),
 
-            new LibGetter{Group="Other", Name="RUNCODE",     Export="Cla$RUNCODE",     Kind=LibKind.Num},
-            new LibGetter{Group="Other", Name="REJECTCODE",  Export="Cla$REJECTCODE",  Kind=LibKind.Num},
-            new LibGetter{Group="Other", Name="SELECTED",    Export="Cla$SELECTED",    Kind=LibKind.Num},
-            new LibGetter{Group="Other", Name="KEYCHAR",     Export="Cla$KEYCHAR",     Kind=LibKind.UNum},
-            new LibGetter{Group="Other", Name="KEYSTATE",    Export="Cla$KEYSTATE",    Kind=LibKind.UNum},
-            new LibGetter{Group="Other", Name="GETEXITCODE", Export="Cla$GETEXITCODE", Kind=LibKind.Num},
-            new LibGetter{Group="Other", Name="TODAY",       Export="Cla$TODAY",       Kind=LibKind.Num},
-            new LibGetter{Group="Other", Name="CLOCK",       Export="Cla$CLOCK",       Kind=LibKind.Num},
+            new LibGetter("Other", "RUNCODE",     "Cla$RUNCODE",     LibKind.Signed),
+            new LibGetter("Other", "REJECTCODE",  "Cla$REJECTCODE",  LibKind.Signed),
+            new LibGetter("Other", "SELECTED",    "Cla$SELECTED",    LibKind.Signed),
+            new LibGetter("Other", "KEYCHAR",     "Cla$KEYCHAR",     LibKind.Unsigned),
+            new LibGetter("Other", "KEYSTATE",    "Cla$KEYSTATE",    LibKind.Unsigned),
+            new LibGetter("Other", "GETEXITCODE", "Cla$GETEXITCODE", LibKind.Signed),
+            new LibGetter("Other", "TODAY",       "Cla$TODAY",       LibKind.Date),
+            new LibGetter("Other", "CLOCK",       "Cla$CLOCK",       LibKind.Time),
         };
-
-        // active batch state (single eval runs at a time — the target is paused while we drive it)
-        private bool _libstateActive;
-        private string _libstateReqId;
-        private int _libstateIdx;
-        private List<LibGetter> _libstateBatch;
-        private List<string> _libstateRows;
 
         /// <summary>The loaded ClaRUN runtime DLL — the image that exports the Cla$ getters. Null when the
         /// app is locally-linked (RTL baked into the EXE, no separate clarun.dll): Library State is then
@@ -75,131 +75,129 @@ namespace ClarionDbg.Cli
             return null;
         }
 
-        /// <summary>libstate reqId — read the paused thread's RTL "Library State" by func-evaling each ClaRUN
-        /// getter on it. Returns true when it kicked the first call (caller must leave the pause loop so the
-        /// target can run); false when it answered inline (no runtime DLL / no thread context).</summary>
-        private bool HandleLibStateCommand(string[] parts, uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx)
+        /// <summary>libstate reqId — read the paused thread's RTL "Library State" by EMULATING each ClaRUN
+        /// getter read-only (no hijack, no re-entrancy → safe at any stop, including inside TakeEvent). Answers
+        /// inline; the caller stays in the pause loop.</summary>
+        private void HandleLibStateCommand(string[] parts, uint tid, IntPtr hThread)
         {
             string reqId = parts.Length > 1 ? parts[1] : "0";
             var rt = RuntimeModule();
-            if (rt == null) { EmitLibStateError(reqId, "RTL not dynamically linked (no ClaRUN.dll) — Library State needs a DLL-runtime build"); return false; }
-            if (!haveCtx)   { EmitLibStateError(reqId, "no thread context for func-eval"); return false; }
+            if (rt == null) { EmitLibStateError(reqId, "RTL not dynamically linked (no ClaRUN.dll) — Library State needs a DLL-runtime build"); return; }
+            if (_hProcess == IntPtr.Zero) { EmitLibStateError(reqId, "no running process"); return; }
+            if (hThread == IntPtr.Zero)   { EmitLibStateError(reqId, "no thread handle for the paused thread"); return; }
 
-            // Only call getters when paused at a SAFE point: the thread must be in the user's own Clarion
-            // code (a TSWD image that isn't the runtime), i.e. between RTL calls. If it's paused INSIDE the
-            // runtime/OS (idle in the ACCEPT message pump, mid-syscall, …), hijacking it to call a getter
-            // re-enters the RTL on a thread already inside it and/or clobbers a syscall frame — which raises
-            // the RTL's internal exception and GPFs the app. Refuse cleanly instead.
-            var em = ModuleAt(ctx.Eip);
-            if (em == null || em.Dbg == null || em == rt)
-            {
-                EmitLibStateError(reqId, "can't read here — the thread is inside the runtime/OS, not your code. Pause at a source breakpoint in your own procedure to read Library State.");
-                return false;
-            }
+            uint teb = GetTebBase(hThread);
+            if (teb == 0) { EmitLibStateError(reqId, "could not resolve the thread's TEB"); return; }
 
-            var batch = new List<LibGetter>();
+            RtlEmulator emu;
+            try { emu = BuildEmulator(rt, tid, teb); }
+            catch (Exception ex) { EmitLibStateError(reqId, "could not build the RTL emulator: " + ex.Message); return; }
+
+            var rows = new List<string>();
             foreach (var g in LibGetters)
             {
-                uint rva = rt.Pe.FindExportRva(g.Export);
-                if (rva == 0) continue;   // this runtime doesn't export it — skip
-                batch.Add(new LibGetter { Group = g.Group, Name = g.Name, Export = g.Export, Kind = g.Kind, Va = rt.LoadBase + rva });
+                string value; LibKind kind = g.Kind; bool ok = true;
+                try
+                {
+                    if (g.Kind == LibKind.Date) value = ClarionDate(DateTime.Today);
+                    else if (g.Kind == LibKind.Time) value = ClarionClock(DateTime.Now);
+                    else
+                    {
+                        uint rva = rt.Pe.FindExportRva(g.Export);
+                        if (rva == 0) { value = "<unavailable>"; ok = false; }   // this runtime doesn't export it
+                        else if (g.Kind == LibKind.Str)
+                        {
+                            uint p = emu.Call(rt.LoadBase + rva);
+                            value = emu.ReadCStringResult(p, 512);
+                        }
+                        else
+                        {
+                            uint v = emu.Call(rt.LoadBase + rva);
+                            value = g.Kind == LibKind.Unsigned ? v.ToString() : ((int)v).ToString();
+                            if (g.Name == "EVENT" && v != 0)
+                            {
+                                string nm = ClarionEvents.Name(v);
+                                if (nm != null) value = value + "  (" + nm + ")";
+                            }
+                        }
+                    }
+                }
+                catch (RtlEmulator.NotSupported)
+                {
+                    value = "<unavailable>"; ok = false;
+                    if (!EmitJson) Console.WriteLine($"  libstate: {g.Name} ({g.Export}) not emulatable on this runtime — skipped");
+                }
+                rows.Add(LibStateRow(g.Group, g.Name, value, kind, ok));
             }
-            if (batch.Count == 0) { EmitLibStateError(reqId, "no Library State getters resolved in " + rt.Name); return false; }
 
-            _libstateBatch = batch; _libstateRows = new List<string>(); _libstateIdx = 0; _libstateReqId = reqId;
-
-            // save the genuine paused state ONCE; every getter call starts from a fresh copy of it so a
-            // call's stack/register churn never leaks into the next (or into the restored pause state).
-            _evalSavedCtx = CloneContext(ref ctx);
-            _evalHadRearm = _rearm.TryGetValue(tid, out _evalSavedRearm);
-            if (_evalHadRearm) _rearm.Remove(tid);
-
-            KickLibStateCall(hThread, batch[0].Va);
-            _libstateActive = true; _evalActive = true; _evalTid = tid;
-            return true;
+            EmitLibStateRows(reqId, rows);
         }
 
-        /// <summary>Hijack the paused thread to call a zero-arg getter at <paramref name="fnVa"/>: on a fresh
-        /// copy of the saved context (keeping the thread's real registers, so a getter that reads a
-        /// thread-context register still resolves), push the magic trap as the return address, set EIP,
-        /// clear the trap flag.</summary>
-        private void KickLibStateCall(IntPtr hThread, uint fnVa)
+        /// <summary>Build the read-only emulator over the runtime DLL: debuggee reads via ReadBlock, TLS via
+        /// the stopped thread's TEB, GetCurrentThreadId == the stopped tid, and the IAT name map so import
+        /// thunks (TlsGetValue/…) resolve to intrinsics.</summary>
+        private RtlEmulator BuildEmulator(LoadedModule rt, uint tid, uint teb)
         {
-            var e = CloneContext(ref _evalSavedCtx);
-            e.Esp = _evalSavedCtx.Esp - 4;
-            WriteU32(e.Esp, EVAL_TRAP_VA);
-            e.Eip = fnVa;
-            e.EFlags &= ~TRAP_FLAG;
-            Native.SetThreadContext(hThread, ref e);
-        }
-
-        /// <summary>A getter call returned cleanly (trap at the magic address): record EAX (numeric) or
-        /// EAX deref'd as a CSTRING (string getters), then advance.</summary>
-        private uint OnLibStateEvalComplete(uint tid)
-        {
-            IntPtr hThread = OpenThreadForContext(tid);
-            var c = NewContext();
-            bool ok = hThread != IntPtr.Zero && Native.GetThreadContext(hThread, ref c);
-            _libstateRows.Add(LibStateRow(_libstateBatch[_libstateIdx], ok ? c.Eax : 0));
-            return AdvanceLibState(tid, hThread);
-        }
-
-        /// <summary>A getter call FAULTED (RTL internal exception or AV) — mark it unavailable, swallow the
-        /// exception (the AdvanceLibState restore/kick keeps it off the app), and move to the next getter.
-        /// Each getter is attempted from the clean saved context, so one fault doesn't lose the rest.</summary>
-        private uint OnLibStateEvalFault(uint tid, uint exCode, uint exAddr)
-        {
-            var g = _libstateBatch[_libstateIdx];
-            _libstateRows.Add("{\"group\":" + Json.Str(g.Group) + ",\"name\":" + Json.Str(g.Name)
-                + ",\"value\":" + Json.Str("<unavailable>") + ",\"kind\":\"err\"}");
-            if (!EmitJson) Console.WriteLine($"  libstate: {g.Name} ({g.Export}) faulted (code 0x{exCode:X} at 0x{exAddr:X}) — skipped");
-            return AdvanceLibState(tid, OpenThreadForContext(tid));
-        }
-
-        /// <summary>Move to the next getter, or finish the batch: restore the genuine pause state, emit the
-        /// `libstate` event, and re-enter the command loop. Each getter's call starts from a fresh copy of
-        /// the saved context (KickLibStateCall), so this doubles as the post-fault recovery.</summary>
-        private uint AdvanceLibState(uint tid, IntPtr hThread)
-        {
-            _libstateIdx++;
-            if (_libstateIdx < _libstateBatch.Count)
+            // IAT slot VA -> bare import function name (BuildIatNameMap keys are slot RVAs, values "dll!func").
+            var imports = new Dictionary<uint, string>();
+            foreach (var kv in rt.Pe.BuildIatNameMap())
             {
-                KickLibStateCall(hThread, _libstateBatch[_libstateIdx].Va);
-                if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
-                return Native.DBG_CONTINUE;   // run the next getter
+                string fn = kv.Value;
+                int bang = fn.IndexOf('!');
+                imports[rt.LoadBase + kv.Key] = bang >= 0 ? fn.Substring(bang + 1) : fn;
             }
-
-            // batch complete — restore the real pause state, report, resume the command loop
-            if (hThread != IntPtr.Zero) Native.SetThreadContext(hThread, ref _evalSavedCtx);
-            if (_evalHadRearm) { _rearm[tid] = _evalSavedRearm; _evalHadRearm = false; }
-            _libstateActive = false; _evalActive = false;
-            EmitLibStateRows(_libstateReqId, _libstateRows);
-            PausedWait(tid, hThread, ref _evalSavedCtx, true, "libstate", emitPaused: false);
-            if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
-            return Native.DBG_CONTINUE;
+            return new RtlEmulator(
+                readMem: (addr, n) => ReadBytesExact(addr, n),
+                tlsGetValue: idx => ReadTlsSlot(teb, idx),
+                curThreadId: tid,
+                teb: teb,
+                importAtSlot: slot => imports.TryGetValue(slot, out var nm) ? nm : null,
+                isCode: va => ModuleAt(va) != null);
         }
 
-        /// <summary>One getter result as a JSON row. Numeric getters take EAX directly (signed/unsigned);
-        /// string getters treat EAX as a char* and read the NUL-terminated text from the target.</summary>
-        private string LibStateRow(LibGetter g, uint eax)
+        /// <summary>Read exactly <paramref name="n"/> bytes from the debuggee, or fewer at a guard page /
+        /// unreadable boundary (the emulator throws NotSupported when short, surfacing as &lt;unavailable&gt;).</summary>
+        private byte[] ReadBytesExact(uint va, int n)
         {
-            string value;
-            if (g.Kind == LibKind.Str)   value = eax == 0 ? "" : ReadCStringAt(eax, 512);
-            else if (g.Kind == LibKind.UNum) value = eax.ToString();
-            else                         value = ((int)eax).ToString();
-            return "{\"group\":" + Json.Str(g.Group) + ",\"name\":" + Json.Str(g.Name)
-                 + ",\"value\":" + Json.Str(value) + ",\"kind\":" + Json.Str(g.Kind.ToString().ToLowerInvariant()) + "}";
-        }
-
-        /// <summary>Read a NUL-terminated ASCII string from the target at <paramref name="va"/> (capped).</summary>
-        private string ReadCStringAt(uint va, int cap)
-        {
-            var buf = new byte[cap];
+            var buf = new byte[n];
             int got = ReadBlock(va, buf);
-            if (got <= 0) return "";
-            int n = Array.IndexOf(buf, (byte)0, 0, got);
-            if (n < 0) n = got;
-            return Encoding.ASCII.GetString(buf, 0, n);
+            if (got == n) return buf;
+            var t = new byte[got < 0 ? 0 : got];
+            Array.Copy(buf, t, t.Length);
+            return t;
+        }
+
+        /// <summary>The stopped thread's TEB base via NtQueryInformationThread(ThreadBasicInformation). 0 on
+        /// failure. THREAD_BASIC_INFORMATION (32-bit): ExitStatus(+0), TebBaseAddress(+4), …</summary>
+        private uint GetTebBase(IntPtr hThread)
+        {
+            var buf = new byte[28];
+            int retLen;
+            return Native.NtQueryInformationThread(hThread, 0, buf, buf.Length, out retLen) == 0
+                ? BitConverter.ToUInt32(buf, 4) : 0;
+        }
+
+        /// <summary>Read a TLS slot from a 32-bit TEB: TlsSlots[64] @ 0xE10, TlsExpansionSlots ptr @ 0xF94.</summary>
+        private uint ReadTlsSlot(uint teb, uint index)
+        {
+            if (index < 64) return ReadU32(teb + 0xE10 + index * 4);
+            uint exp = ReadU32(teb + 0xF94);
+            return exp == 0 ? 0 : ReadU32(exp + (index - 64) * 4);
+        }
+
+        // Clarion DATE = days since 1800-12-28; TIME = centiseconds-since-midnight + 1.
+        private static string ClarionDate(DateTime d) =>
+            ((int)(d.Date - new DateTime(1800, 12, 28)).TotalDays).ToString();
+        private static string ClarionClock(DateTime t) =>
+            ((int)(t.TimeOfDay.TotalMilliseconds / 10) + 1).ToString();
+
+        /// <summary>One Library State result as a JSON row. The addin special-cases kind "str" (quotes the
+        /// value); every numeric kind maps to "num", and a read that couldn't run maps to "err".</summary>
+        private string LibStateRow(string group, string name, string value, LibKind kind, bool ok)
+        {
+            string k = !ok ? "err" : kind == LibKind.Str ? "str" : "num";
+            return "{\"group\":" + Json.Str(group) + ",\"name\":" + Json.Str(name)
+                 + ",\"value\":" + Json.Str(value) + ",\"kind\":" + Json.Str(k) + "}";
         }
 
         private void EmitLibStateRows(string reqId, List<string> rows)

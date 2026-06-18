@@ -333,17 +333,9 @@ namespace ClarionDbg.Cli
                         }
                         else if (_evalActive && tid == _evalTid && exAddr == EVAL_TRAP_VA)
                         {
-                            // a hijacked func-eval call returned into our unmapped magic address. The
-                            // Library-State batch drives many calls in sequence (its own completion handler
-                            // chains the next); a watch is the single THR$GetInstance round-trip.
-                            status = _libstateActive ? OnLibStateEvalComplete(tid) : OnEvalComplete(tid);
-                        }
-                        else if (_libstateActive && tid == _evalTid)
-                        {
-                            // a Library-State getter FAULTED (the RTL raised its internal exception, or an
-                            // AV) while we were driving it. SWALLOW it — it must never reach the app's
-                            // handler (that GPFs the debuggee) — mark the getter unavailable and move on.
-                            status = OnLibStateEvalFault(tid, exCode, exAddr);
+                            // a hijacked func-eval call (a `watch` of THREADed data) returned into our
+                            // unmapped magic address — collect its result and restore the pause state.
+                            status = OnEvalComplete(tid);
                         }
                         else
                         {
@@ -484,10 +476,10 @@ namespace ClarionDbg.Cli
             // so the host can show "in ClaRUN.dll!Cla$PushLong+0x7" instead of "(unresolved)".
             string sym = (haveCtx && !resolved) ? NearestImportSymbol(va) : null;
 
-            // emitPaused is false when we re-enter the loop AFTER a transparent func-eval (watch/libstate):
-            // the user is still stopped at the SAME place and the result already went out on its own event,
-            // so re-announcing a `paused` would (for the auto-refreshing Library State panel) feed an
-            // infinite refresh loop. Stay silent and just resume servicing commands.
+            // emitPaused is false when we re-enter the loop AFTER a transparent func-eval (a `watch` of
+            // THREADed data): the user is still stopped at the SAME place and the result already went out on
+            // its own event, so re-announcing a `paused` would feed any auto-refreshing panel an infinite
+            // refresh loop. Stay silent and just resume servicing commands.
             if (emitPaused)
             {
                 if (EmitJson)
@@ -596,10 +588,10 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "libstate":
-                        // per-thread RTL "Library State" (ERROR/EVENT/FIELD/…) via a batch of getter
-                        // func-evals on the paused thread; leave the pause loop so the calls can run.
-                        if (HandleLibStateCommand(parts, tid, hThread, ref ctx, haveCtx))
-                            return;
+                        // per-thread RTL "Library State" (ERROR/EVENT/FIELD/…). Read by EMULATING each
+                        // ClaRUN getter read-only — synchronous and safe at any stop, so it answers inline
+                        // (no thread hijack, no leaving the pause loop).
+                        HandleLibStateCommand(parts, tid, hThread);
                         break;
 
                     case "quit": case "q": case "kill":
